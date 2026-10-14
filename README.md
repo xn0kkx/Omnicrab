@@ -1,71 +1,56 @@
 # 🦀 omnicrab
 
-A terminal UI written in Rust that connects **many AI accounts and local models** and **orchestrates agents across them**. Think Claude Code / Hermes, but provider-agnostic, with per-account usage tracking and every byte of stored data encrypted at the application layer before it reaches PostgreSQL.
+omnicrab is a terminal UI that connects many AI accounts and local models and lets you chat with them, compare them, and have agents on different accounts work together. It shows how much each account is using, and everything it stores is encrypted before it reaches PostgreSQL.
 
-## Features
+## What you can do
 
-- **Many providers, many accounts** – Anthropic, OpenAI, Gemini, OpenRouter, Groq, DeepSeek, xAI, Mistral via API key; Ollama and any OpenAI-compatible server (llama.cpp, LM Studio, vLLM) locally.
-- **Subscriptions through official CLIs** – `claude`, `codex` and `gemini` run in headless mode, so subscription logins are never extracted or reused.
-- **Named accounts** – give each account its own name ("Claude Work", "OpenAI Personal") and rename it any time.
-- **Usage dashboard** – requests, tokens in/out and cost per account for today / 7d / 30d / all time, a 30-day token sparkline, per-account monthly budget gauge and a cost bar chart.
-- **Agent orchestration** – named agents with roles, system prompts, a primary account and ordered fallbacks; `@agent` routing; `/fanout` to compare accounts side by side; `/orchestrate` for plan → parallel workers → synthesis.
-- **Failover and budgets** – rate limits, auth errors, 5xx and exhausted monthly budgets move the request to the next account.
-- **Application-layer encryption** – Argon2id → key-encryption key → data key → XChaCha20-Poly1305 per record, with AAD bound to table, column and row. See [docs/security.md](docs/security.md).
-- **Persistent sessions** stored (encrypted) in PostgreSQL.
+- Connect several accounts per provider (Anthropic, OpenAI, Gemini, OpenRouter, Groq, DeepSeek, xAI, Mistral) and give each one its own name.
+- Use local models through Ollama or any OpenAI-compatible server.
+- Use Claude Code, Codex and Gemini subscriptions through their official CLIs.
+- Watch requests, tokens and cost per account, with optional monthly budgets.
+- Define named agents and route messages with `@agent`.
+- Send one prompt to several accounts with `/fanout`, or let agents split a task with `/orchestrate`.
+- Fall back to another account automatically on rate limits, auth errors or exhausted budgets.
 
-## Requirements
+## Install
 
-- Linux, Rust 1.85+ (edition 2024; developed on 1.95)
-- PostgreSQL (any recent version)
-- Optional: [Ollama](https://ollama.com), and the `claude` / `codex` / `gemini` CLIs
-
-## Quick start
+You need Linux, Rust, and PostgreSQL.
 
 ```bash
-# 1. Create a database (once)
-createdb omnicrab
-
-# 2. Point omnicrab at it. Password via ~/.pgpass or PGPASSWORD.
-export OMNICRAB_DATABASE_URL=postgres://USER@localhost/omnicrab
-
-# 3. Build and check your environment
+git clone git@github.com:xn0kkx/Omnicrab.git
+cd Omnicrab
 cargo build --release
-./target/release/omnicrab doctor
-
-# 4. Run
-./target/release/omnicrab
 ```
 
-On first launch you choose a **master password**. It is never stored and **cannot be recovered**: losing it means losing the data.
+## Set up
 
-Then press `Tab` for the Accounts tab and `a` to add an account, or `D` to auto-detect Ollama and installed CLIs.
+```bash
+createdb omnicrab
+export OMNICRAB_DATABASE_URL=postgres://USER@localhost/omnicrab   # password via ~/.pgpass or PGPASSWORD
+./target/release/omnicrab doctor    # checks the database, Ollama and installed CLIs
+./target/release/omnicrab           # starts the TUI
+```
 
-You can also set `database_url` in `~/.config/omnicrab/config.toml`; the environment variable takes precedence.
+On first launch you choose a master password. It is never stored and cannot be recovered.
 
-## Keys and commands
+## Use it
+
+1. Press `Tab` to open **Accounts**, then `a` to add an account (or `D` to detect Ollama and installed CLIs). Press `t` to test it.
+2. Press `Enter` on an account to make it the chat target, then type a message and press `Enter`.
+3. Use `@name message` to talk to a specific account or agent, and `/help` to see all commands.
+4. Open **Usage** (`F4`) to see consumption per account.
 
 | Key | Action |
 | --- | --- |
-| `F1`–`F5` / `Tab` | Switch tabs (Chat, Accounts, Agents, Usage, Sessions) |
-| `Enter` / `Alt+Enter` | Send / newline in the message box |
-| `Esc` / `Ctrl+C` | Cancel running requests (`Ctrl+C` quits when idle) |
-| `Ctrl+N` / `Ctrl+L` | New session / lock the vault |
-| `PgUp` / `PgDn` | Scroll chat |
-
-Slash commands: `/help /new /sessions /usage /accounts /agents /use /model /fanout /orchestrate /rename /passwd /lock /clear /quit`. Full reference in [docs/usage.md](docs/usage.md).
+| `F1`–`F5` / `Tab` | Switch tabs |
+| `Enter` / `Alt+Enter` | Send / new line |
+| `Esc` | Cancel running requests |
+| `Ctrl+N` / `Ctrl+L` | New session / lock |
 
 ## Documentation
 
-- [Usage guide](docs/usage.md) – TUI tour, accounts, agents, orchestration
-- [Providers](docs/providers.md) – supported providers, CLI integration, local models, pricing
-- [Architecture](docs/architecture.md) – modules, data flow, database schema
-- [Security](docs/security.md) – threat model and encryption design
-- [Development](docs/development.md) – building, testing, contributing
-
-## Status
-
-Early-stage (v0.1). Unit tests cover encryption, usage aggregation, CLI output parsing and plan parsing. The PostgreSQL store, the TUI and the CLI/HTTP provider adapters have not yet been verified end-to-end; expect rough edges and please report issues.
-
-## License
-
-MIT
+- [Usage guide](docs/usage.md)
+- [Providers](docs/providers.md)
+- [Architecture](docs/architecture.md)
+- [Security](docs/security.md)
+- [Development and project status](docs/development.md)

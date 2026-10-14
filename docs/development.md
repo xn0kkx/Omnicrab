@@ -1,5 +1,13 @@
 # Development
 
+## Status
+
+Early-stage (v0.1), released under the MIT license (see `LICENSE`). Unit tests cover encryption, usage aggregation, CLI output parsing and plan parsing. The PostgreSQL store, the TUI and the CLI/HTTP provider adapters have not yet been verified end-to-end. The Codex and Gemini adapters follow their documented JSONL formats but have never run against the real CLIs.
+
+## Requirements
+
+Linux, Rust 1.85+ (edition 2024; developed on 1.95) and PostgreSQL. Optional: Ollama and the `claude` / `codex` / `gemini` CLIs.
+
 ## Build and test
 
 ```bash
