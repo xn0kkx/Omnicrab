@@ -220,7 +220,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         for l in [
             "Welcome to omnicrab.",
             "",
-            "  - Tab -> Accounts, then 'a' to add one (or 'D' to auto-detect Ollama / installed CLIs)",
+            "  - Tab -> Accounts, then 'a' to add one (or 'D' to auto-detect installed CLIs)",
             "  - type a message, or @name to route to an agent/account",
             "  - /fanout a,b <prompt>   /orchestrate <task>   /help",
         ] {
@@ -438,12 +438,19 @@ fn draw_accounts(f: &mut Frame, app: &App, area: Rect) {
         app.sel[1],
         table_block(
             "Accounts",
-            "a add · e edit/rename · t test · space on/off · Enter use · d delete · D detect local",
+            "a add · e edit/rename · t test · space on/off · Enter use · d delete · D detect CLIs",
         ),
     );
     if app.accounts.is_empty() {
         let a = centered(area, 60, 3);
-        f.render_widget(Paragraph::new("No accounts yet. Press 'a' to add one, or 'D' to detect Ollama and installed CLIs.").alignment(Alignment::Center).wrap(Wrap { trim: true }), a);
+        f.render_widget(
+            Paragraph::new(
+                "No accounts yet. Press 'a' to add one, or 'D' to detect installed CLIs.",
+            )
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+            a,
+        );
     }
 }
 

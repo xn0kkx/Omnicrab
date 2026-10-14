@@ -4,11 +4,11 @@
 
 Early-stage (v0.1), released under the MIT license (see `LICENSE`).
 
-Verified end-to-end on Linux with PostgreSQL 17 and the real Claude Code CLI and Ollama:
+Verified end-to-end on Linux with PostgreSQL 17 and the real Claude Code CLI, Antigravity (`agy`) CLI and Ollama:
 
 - vault creation, wrong-password rejection, unlock after a wrong attempt, lock/unlock
 - account detection, add/edit (form), connection test, usage per account
-- streaming chat with Claude Code CLI and Ollama, cancellation with `Esc`
+- streaming chat with Claude Code CLI, agy and Ollama, cancellation with `Esc`
 - `@name` routing and `/fanout` with account names containing spaces
 - agents, failover to a fallback account, `/orchestrate` (plan → worker → synthesis)
 - session persistence and resume after restart

@@ -6,7 +6,7 @@ omnicrab is a terminal UI that connects many AI accounts and local models and le
 
 - Connect several accounts per provider (Anthropic, OpenAI, Gemini, OpenRouter, Groq, DeepSeek, xAI, Mistral) and give each one its own name.
 - Use local models through Ollama or any OpenAI-compatible server.
-- Use Claude Code, Codex and Gemini subscriptions through their official CLIs.
+- Use Claude Code, Antigravity (`agy`), Codex and Gemini subscriptions through their official CLIs.
 - Watch requests, tokens and cost per account, with optional monthly budgets.
 - Define named agents and route messages with `@agent`.
 - Send one prompt to several accounts with `/fanout`, or let agents split a task with `/orchestrate`.
@@ -35,7 +35,7 @@ On first launch you choose a master password. It is never stored and cannot be r
 
 ## Use it
 
-1. Press `Tab` to open **Accounts**, then `a` to add an account (or `D` to detect Ollama and installed CLIs). Press `t` to test it.
+1. Press `Tab` to open **Accounts**, then `a` to add an account (or `D` to detect installed CLIs). Press `t` to test it.
 2. Press `Enter` on an account to make it the chat target, then type a message and press `Enter`.
 3. Use `@name message` to talk to a specific account or agent, and `/help` to see all commands.
 4. Open **Usage** (`F4`) to see consumption per account.

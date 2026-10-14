@@ -31,6 +31,7 @@ Anthropic's terms do not allow using Free/Pro/Max OAuth tokens in third-party ap
 | --- | --- |
 | Claude Code | `claude -p <prompt> --output-format stream-json --verbose --include-partial-messages --no-session-persistence --strict-mcp-config --tools ""` |
 | Codex | `codex exec --json --skip-git-repo-check --sandbox read-only <prompt>` |
+| Antigravity (`agy`) | `agy --output-format stream-json --mode plan --disable-slash-commands -p <prompt>` |
 | Gemini CLI | `gemini --output-format stream-json -p <prompt>` |
 
 Details:
@@ -41,6 +42,7 @@ Details:
 - `--strict-mcp-config` stops the CLI from loading the MCP servers of your global config, which otherwise adds ~20k input tokens (about 5× the cost) to every request.
 - Token counts and (for Claude) `total_cost_usd` come from the CLI's final JSON event.
 - A custom binary path can be set per account.
+- **Antigravity (`agy`)**: runs with `--mode plan` so the agent stays read-only and nothing is auto-approved. Plan mode prefixes answers with a marker like `[MAHI68]`, which omnicrab strips. `agy` reports tokens but no cost, and its model name is not part of the output, so cost shows `$0` unless you set the account's **Model** (for example `claude-sonnet-5-5-medium`, see `agy models`) and the price table has a matching prefix. Its built-in context is large (~17k input tokens per request).
 - Output formats change between CLI versions. Parsers ignore unknown events; if a CLI starts failing, check the log and `omnicrab doctor`.
 
 Check the current terms of each vendor before relying on this for automation.

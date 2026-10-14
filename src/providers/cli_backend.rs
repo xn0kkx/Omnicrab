@@ -88,6 +88,24 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
             }
             c.arg(prompt);
         }
+        ProviderKind::AgyCli => {
+            let prompt = match &req.system {
+                Some(s) => format!("{s}\n\n{prompt}"),
+                None => prompt,
+            };
+            // `--mode plan` keeps the agent read-only; it never gets auto-approved permissions.
+            c.args([
+                "--output-format",
+                "stream-json",
+                "--mode",
+                "plan",
+                "--disable-slash-commands",
+            ]);
+            if !model.is_empty() {
+                c.args(["--model", &model]);
+            }
+            c.args(["-p", &prompt]);
+        }
         _ => {
             let prompt = match &req.system {
                 Some(s) => format!("{s}\n\n{prompt}"),
@@ -107,6 +125,17 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
     // Run in a neutral directory so the CLI doesn't pick up project context/tools.
     c.current_dir(std::env::temp_dir());
     c
+}
+
+/// In `--mode plan`, agy starts its answer with a `[MAHI68]`-style marker line.
+fn strip_agy_tag(s: &str) -> &str {
+    let t = s.trim_start();
+    match t.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((tag, rest)) if !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            rest.trim_start_matches(['\n', ' '])
+        }
+        _ => s,
+    }
 }
 
 #[derive(Default)]
@@ -191,6 +220,35 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
             }
             _ => {}
         },
+        ProviderKind::AgyCli => match v["event"].as_str().unwrap_or("") {
+            "step_update" => {
+                let st = &v["step_update"];
+                if st["step_type"] == "agent_response" && st["state"] == "ACTIVE" {
+                    p.delta = st["text_delta"].as_str().map(str::to_string);
+                }
+            }
+            "result" => {
+                let r = &v["result"];
+                if r["status"] == "SUCCESS" {
+                    p.full = r["response"].as_str().map(str::to_string);
+                    p.usage = Some(TokenUsage {
+                        input: u(&r["usage"], "input_tokens"),
+                        output: u(&r["usage"], "output_tokens"),
+                        reported_cost_usd: None,
+                    });
+                } else {
+                    let msg = r["error"]
+                        .as_str()
+                        .or(r["response"].as_str())
+                        .unwrap_or("agy CLI error");
+                    p.error = Some(format!(
+                        "{}: {msg}",
+                        r["status"].as_str().unwrap_or("FAILED")
+                    ));
+                }
+            }
+            _ => {}
+        },
         _ => match ty {
             "message" if v["role"] == "assistant" => {
                 p.delta = v["content"].as_str().map(str::to_string);
@@ -262,7 +320,13 @@ pub async fn stream(
         };
         let Ok(Some(line)) = line else { break };
         let p = parse_line(account.kind, &line);
-        if let Some(d) = p.delta {
+        if let Some(mut d) = p.delta {
+            if account.kind == ProviderKind::AgyCli && !streamed {
+                d = strip_agy_tag(&d).to_string();
+            }
+            if d.is_empty() {
+                continue;
+            }
             streamed = true;
             if tx.send(ProviderEvent::Delta(d)).await.is_err() {
                 let _ = child.kill().await;
@@ -300,6 +364,11 @@ pub async fn stream(
         && account.kind != ProviderKind::CodexCli
         && let Some(t) = last_full
     {
+        let t = if account.kind == ProviderKind::AgyCli {
+            strip_agy_tag(&t).trim_end().to_string()
+        } else {
+            t
+        };
         let _ = tx.send(ProviderEvent::Delta(t)).await;
     }
     let model = model.unwrap_or_else(|| {
@@ -351,6 +420,38 @@ mod tests {
             r#"{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":4}}"#,
         );
         assert_eq!(t.usage.unwrap().output, 4);
+    }
+
+    #[test]
+    fn agy_delta_result_and_error() {
+        let d = parse_line(
+            ProviderKind::AgyCli,
+            r#"{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"pong"}}"#,
+        );
+        assert_eq!(d.delta.as_deref(), Some("pong"));
+        let done = parse_line(
+            ProviderKind::AgyCli,
+            r#"{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":"\n"}}"#,
+        );
+        assert!(done.delta.is_none());
+        let r = parse_line(
+            ProviderKind::AgyCli,
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"pong\n","usage":{"input_tokens":7,"output_tokens":3}}}"#,
+        );
+        assert_eq!(r.usage.unwrap().input, 7);
+        let e = parse_line(
+            ProviderKind::AgyCli,
+            r#"{"event":"result","result":{"status":"FAILED","error":"quota exceeded"}}"#,
+        );
+        assert!(e.error.unwrap().contains("quota"));
+    }
+
+    #[test]
+    fn agy_tag_is_stripped() {
+        assert_eq!(strip_agy_tag("[MAHI68]\nTokio"), "Tokio");
+        assert_eq!(strip_agy_tag("[MAHI68] Tokio"), "Tokio");
+        assert_eq!(strip_agy_tag("Tokio"), "Tokio");
+        assert_eq!(strip_agy_tag("[note: x] keep"), "[note: x] keep");
     }
 
     #[test]

@@ -771,11 +771,11 @@ impl App {
 
     fn detect_local(&mut self) {
         let tx = self.tx.clone();
-        let have_ollama = self.accounts.iter().any(|a| a.kind == ProviderKind::Ollama);
         let missing_clis: Vec<ProviderKind> = [
             ProviderKind::ClaudeCli,
             ProviderKind::CodexCli,
             ProviderKind::GeminiCli,
+            ProviderKind::AgyCli,
         ]
         .into_iter()
         .filter(|k| {
@@ -784,30 +784,10 @@ impl App {
         })
         .collect();
         let core = self.core.clone();
-        self.notice = Some("detecting local providers...".into());
+        self.notice = Some("detecting installed CLIs...".into());
         tokio::spawn(async move {
             let Some(core) = core else { return };
             let mut added = vec![];
-            if !have_ollama
-                && let Ok(models) =
-                    providers::ollama_discovery::list_models("http://localhost:11434").await
-                && let Some(m) = models.first()
-            {
-                let a = Account {
-                    id: Uuid::nil(),
-                    name: "Ollama local".into(),
-                    kind: ProviderKind::Ollama,
-                    api_key: None,
-                    base_url: Some("http://localhost:11434".into()),
-                    model: m.clone(),
-                    cli_path: None,
-                    budget_usd_month: None,
-                    enabled: true,
-                };
-                if core.store.upsert_account(&core.vault, &a).await.is_ok() {
-                    added.push(format!("Ollama ({} models)", models.len()));
-                }
-            }
             for k in missing_clis {
                 let a = Account {
                     id: Uuid::nil(),

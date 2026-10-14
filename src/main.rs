@@ -94,7 +94,7 @@ async fn doctor(cfg: &config::Config) -> Result<()> {
         ),
         Err(_) => println!("ollama      : not reachable at localhost:11434"),
     }
-    for bin in ["claude", "codex", "gemini"] {
+    for bin in ["claude", "agy", "codex", "gemini"] {
         match providers::which(bin) {
             Some(p) => println!("{bin:<12}: {}", p.display()),
             None => println!("{bin:<12}: not installed"),

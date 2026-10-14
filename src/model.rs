@@ -21,6 +21,7 @@ pub enum ProviderKind {
     ClaudeCli,
     CodexCli,
     GeminiCli,
+    AgyCli,
 }
 
 impl ProviderKind {
@@ -38,6 +39,7 @@ impl ProviderKind {
         Self::ClaudeCli,
         Self::CodexCli,
         Self::GeminiCli,
+        Self::AgyCli,
     ];
 
     pub fn label(self) -> &'static str {
@@ -55,6 +57,7 @@ impl ProviderKind {
             Self::ClaudeCli => "Claude Code CLI (subscription)",
             Self::CodexCli => "Codex CLI (subscription)",
             Self::GeminiCli => "Gemini CLI (subscription)",
+            Self::AgyCli => "Antigravity CLI - agy (subscription)",
         }
     }
 
@@ -73,18 +76,27 @@ impl ProviderKind {
             Self::ClaudeCli => "claude-cli",
             Self::CodexCli => "codex-cli",
             Self::GeminiCli => "gemini-cli",
+            Self::AgyCli => "agy-cli",
         }
     }
 
     pub fn needs_api_key(self) -> bool {
         !matches!(
             self,
-            Self::Ollama | Self::OpenAiCompat | Self::ClaudeCli | Self::CodexCli | Self::GeminiCli
+            Self::Ollama
+                | Self::OpenAiCompat
+                | Self::ClaudeCli
+                | Self::CodexCli
+                | Self::GeminiCli
+                | Self::AgyCli
         )
     }
 
     pub fn is_cli(self) -> bool {
-        matches!(self, Self::ClaudeCli | Self::CodexCli | Self::GeminiCli)
+        matches!(
+            self,
+            Self::ClaudeCli | Self::CodexCli | Self::GeminiCli | Self::AgyCli
+        )
     }
 
     pub fn is_local(self) -> bool {
@@ -103,7 +115,7 @@ impl ProviderKind {
             Self::Mistral => "mistral-large-latest",
             Self::Ollama => "qwen3-coder:30b",
             Self::OpenAiCompat => "local-model",
-            Self::ClaudeCli | Self::CodexCli | Self::GeminiCli => "",
+            Self::ClaudeCli | Self::CodexCli | Self::GeminiCli | Self::AgyCli => "",
         }
     }
 
@@ -120,6 +132,7 @@ impl ProviderKind {
             Self::ClaudeCli => Some("claude"),
             Self::CodexCli => Some("codex"),
             Self::GeminiCli => Some("gemini"),
+            Self::AgyCli => Some("agy"),
             _ => None,
         }
     }
