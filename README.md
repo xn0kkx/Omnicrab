@@ -19,7 +19,17 @@ You need Linux, Rust, and PostgreSQL.
 ```bash
 git clone git@github.com:xn0kkx/Omnicrab.git
 cd Omnicrab
-cargo build --release
+cargo install --path . --root ~/.local --locked   # installs `omnicrab` into ~/.local/bin
+```
+
+Make sure `~/.local/bin` is in your `PATH`.
+
+## Update
+
+```bash
+cd Omnicrab
+git pull
+cargo install --path . --root ~/.local --locked
 ```
 
 ## Set up
@@ -27,8 +37,8 @@ cargo build --release
 ```bash
 createdb omnicrab
 export OMNICRAB_DATABASE_URL=postgres://USER@localhost/omnicrab   # password via ~/.pgpass or PGPASSWORD
-./target/release/omnicrab doctor    # checks the database, Ollama and installed CLIs
-./target/release/omnicrab           # starts the TUI
+omnicrab doctor    # checks the database, Ollama and installed CLIs
+omnicrab           # starts the TUI
 ```
 
 On first launch you choose a master password. It is never stored and cannot be recovered.
