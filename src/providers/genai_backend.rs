@@ -161,6 +161,7 @@ mod tests {
             base_url: base.map(Into::into),
             model: "m".into(),
             cli_path: None,
+            profile_dir: None,
             budget_usd_month: None,
             enabled: true,
         }

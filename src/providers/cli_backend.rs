@@ -42,6 +42,55 @@ fn binary(a: &Account) -> Result<String, ProviderError> {
         .ok_or_else(|| ProviderError::new(format!("`{name}` not found in PATH"), true))
 }
 
+/// Expands `~` and creates the profile directory (private) if needed.
+fn profile_path(dir: &str) -> std::path::PathBuf {
+    let p = match dir.strip_prefix("~/") {
+        Some(rest) => directories::BaseDirs::new()
+            .map(|b| b.home_dir().join(rest))
+            .unwrap_or_else(|| dir.into()),
+        None => dir.into(),
+    };
+    let _ = std::fs::create_dir_all(&p);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+    }
+    p
+}
+
+/// Env for a CLI subprocess: points it at the account's own login directory
+/// and drops variables that would override or confuse subscription auth.
+/// omnicrab never reads what the CLI stores there.
+fn apply_env(c: &mut Command, a: &Account) {
+    if let (Some(var), Some(dir)) = (
+        a.kind.profile_env(),
+        a.profile_dir.as_deref().filter(|d| !d.is_empty()),
+    ) {
+        c.env(var, profile_path(dir));
+    }
+    if a.kind == ProviderKind::ClaudeCli {
+        // An API key in the environment wins over the subscription in `-p` mode.
+        for v in ["ANTHROPIC_API_KEY", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"] {
+            c.env_remove(v);
+        }
+    }
+}
+
+/// Interactive sign-in command for the account (inherits the terminal).
+pub fn login_command(a: &Account) -> Result<std::process::Command, ProviderError> {
+    if a.kind.login_args().is_empty() {
+        return Err(ProviderError::new(
+            "this provider has no separate sign-in flow",
+            false,
+        ));
+    }
+    let mut c = Command::new(binary(a)?);
+    c.args(a.kind.login_args());
+    apply_env(&mut c, a);
+    Ok(c.into_std())
+}
+
 fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
     let prompt = flatten(req);
     let model = req
@@ -122,6 +171,7 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    apply_env(&mut c, a);
     // Run in a neutral directory so the CLI doesn't pick up project context/tools.
     c.current_dir(std::env::temp_dir());
     c
@@ -389,6 +439,31 @@ pub async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_profile_env() {
+        let dir = std::env::temp_dir().join("omnicrab-test-profile");
+        let a = Account {
+            id: uuid::Uuid::nil(),
+            name: "t".into(),
+            kind: ProviderKind::ClaudeCli,
+            api_key: None,
+            base_url: None,
+            model: String::new(),
+            cli_path: None,
+            profile_dir: Some(dir.to_string_lossy().into_owned()),
+            budget_usd_month: None,
+            enabled: true,
+        };
+        let mut c = Command::new("claude");
+        apply_env(&mut c, &a);
+        let envs: Vec<_> = c.as_std().get_envs().collect();
+        let get = |k: &str| envs.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+        assert_eq!(get("CLAUDE_CONFIG_DIR"), Some(Some(dir.as_os_str())));
+        assert_eq!(get("ANTHROPIC_API_KEY"), Some(None));
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir(&dir);
+    }
 
     #[test]
     fn claude_delta_and_result() {

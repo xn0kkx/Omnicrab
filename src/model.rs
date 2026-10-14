@@ -127,6 +127,23 @@ impl ProviderKind {
         }
     }
 
+    /// Env var that points the CLI at a per-account credential directory.
+    /// Only set for CLIs where this is documented and keeps logins separate.
+    pub fn profile_env(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeCli => Some("CLAUDE_CONFIG_DIR"),
+            _ => None,
+        }
+    }
+
+    /// Arguments of the CLI's own interactive sign-in flow.
+    pub fn login_args(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCli => &["auth", "login"],
+            _ => &[],
+        }
+    }
+
     pub fn cli_binary(self) -> Option<&'static str> {
         match self {
             Self::ClaudeCli => Some("claude"),
@@ -152,6 +169,9 @@ pub struct Account {
     pub model: String,
     #[serde(default)]
     pub cli_path: Option<String>,
+    /// Credential directory for a separate subscription login (see `ProviderKind::profile_env`).
+    #[serde(default)]
+    pub profile_dir: Option<String>,
     #[serde(default)]
     pub budget_usd_month: Option<f64>,
     #[serde(default = "yes")]
@@ -271,6 +291,7 @@ mod tests {
             base_url: None,
             model: "m".into(),
             cli_path: None,
+            profile_dir: None,
             budget_usd_month: Some(10.0),
             enabled: true,
         };

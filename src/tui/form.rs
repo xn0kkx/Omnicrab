@@ -8,6 +8,7 @@ pub enum FieldId {
     BaseUrl,
     Model,
     CliPath,
+    ProfileDir,
     Budget,
     Role,
     Prompt,
@@ -120,6 +121,7 @@ impl Form {
             FieldId::ApiKey => kind.needs_api_key(),
             FieldId::BaseUrl => kind.is_local(),
             FieldId::CliPath => kind.is_cli(),
+            FieldId::ProfileDir => kind.profile_env().is_some(),
             FieldId::Model => true,
             _ => true,
         }

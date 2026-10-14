@@ -157,6 +157,8 @@ pub struct App {
     pub lane_tx: mpsc::UnboundedSender<(LaneId, RunEvent)>,
     pub quit: bool,
     pub tick: u64,
+    /// Set by `L`; the run loop suspends the TUI and runs it on the real terminal.
+    pending_login: Option<(std::process::Command, Account)>,
 }
 
 pub const COMMANDS: &[(&str, &str)] = &[
@@ -236,6 +238,7 @@ impl App {
             lane_tx,
             quit: false,
             tick: 0,
+            pending_login: None,
         };
         Ok((app, rx, lane_rx))
     }
@@ -253,7 +256,24 @@ impl App {
                 terminal.draw(|f| super::ui::draw(f, &self))?;
                 tokio::select! {
                     ev = events.next() => match ev {
-                        Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => self.on_key(k),
+                        Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
+                            self.on_key(k);
+                            if let Some((mut cmd, acct)) = self.pending_login.take() {
+                                drop(events);
+                                ratatui::restore();
+                                let status = cmd.status();
+                                terminal = ratatui::init();
+                                events = EventStream::new();
+                                self.notice = Some(match status {
+                                    Ok(s) if s.success() => {
+                                        self.test_account(acct, false);
+                                        "signed in, testing connection...".to_string()
+                                    }
+                                    Ok(s) => format!("sign-in exited with {s}"),
+                                    Err(e) => format!("could not start sign-in: {e}"),
+                                });
+                            }
+                        }
                         Some(Err(e)) => return Err(e.into()),
                         None => break,
                         _ => {}
@@ -765,6 +785,14 @@ impl App {
                 }
             }
             KeyCode::Char('D') => self.detect_local(),
+            KeyCode::Char('L') => {
+                if let Some(a) = sel {
+                    match providers::cli_backend::login_command(&a) {
+                        Ok(c) => self.pending_login = Some((c, a)),
+                        Err(e) => self.notice = Some(e.to_string()),
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -797,6 +825,7 @@ impl App {
                     base_url: None,
                     model: String::new(),
                     cli_path: None,
+                    profile_dir: None,
                     budget_usd_month: None,
                     enabled: true,
                 };
@@ -860,6 +889,12 @@ impl App {
                 edit.and_then(|a| a.cli_path.clone()).unwrap_or_default(),
             )
             .hint("empty = look up in PATH"),
+            Field::text(
+                FieldId::ProfileDir,
+                "Profile dir",
+                edit.and_then(|a| a.profile_dir.clone()).unwrap_or_default(),
+            )
+            .hint("empty = default login; e.g. ~/.omnicrab/claude-work (press L in Accounts to sign in)"),
             Field::text(
                 FieldId::Budget,
                 "Budget USD/mo",
@@ -927,6 +962,11 @@ impl App {
             model: f.value(FieldId::Model),
             cli_path: if kind.is_cli() {
                 opt(FieldId::CliPath)
+            } else {
+                None
+            },
+            profile_dir: if kind.profile_env().is_some() {
+                opt(FieldId::ProfileDir)
             } else {
                 None
             },

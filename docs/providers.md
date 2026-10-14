@@ -47,6 +47,19 @@ Details:
 
 Check the current terms of each vendor before relying on this for automation.
 
+### Multiple subscription accounts
+
+Each CLI-backed account can have its own **Profile dir**. omnicrab starts the CLI with an environment variable pointing at that directory, so every account keeps a separate login:
+
+| Kind | Variable | Status |
+| --- | --- | --- |
+| Claude Code | `CLAUDE_CONFIG_DIR` | Supported |
+| Antigravity (`agy`) | none documented | Not supported yet. `agy` keeps one login per machine (system keyring). A per-account `HOME` is reported to work by community tools but is unverified here. |
+
+Flow for a second Claude account: add an account of kind *Claude Code CLI*, set **Profile dir** (for example `~/.omnicrab/claude-work`), save, select it in **Accounts** and press `L`. omnicrab suspends the TUI and runs `claude auth login` for that profile, then tests the connection. Sign-in goes through Anthropic's own flow; omnicrab never reads or stores the credentials in the directory.
+
+For Claude accounts omnicrab also removes `ANTHROPIC_API_KEY` from the subprocess environment, because in `-p` mode an API key would otherwise take precedence over the subscription.
+
 ## Pricing
 
 Cost for API accounts = `tokens_in × input + tokens_out × output` per 1M tokens, looked up by the **longest model-name prefix** in:

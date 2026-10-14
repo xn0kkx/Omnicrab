@@ -192,6 +192,7 @@ mod tests {
             base_url: None,
             model: String::new(),
             cli_path: None,
+            profile_dir: None,
             budget_usd_month: None,
             enabled: true,
         }

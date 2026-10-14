@@ -30,6 +30,7 @@ Lists share navigation keys: `↑/↓` or `j/k` to move, `Esc` to return to Chat
 | `Space` | Enable/disable |
 | `Enter` / `u` | Use as the chat target (★) |
 | `d` | Delete (with confirmation) |
+| `L` | Sign in the selected CLI account (runs the CLI's own login for its **Profile dir**) |
 | `D` | Detect installed CLIs (`claude`, `agy`, `codex`, `gemini`) and add them |
 
 The add/edit form only shows the fields relevant to the chosen provider. `Ctrl+T` tests the connection from inside the form. When editing, leave **API key** empty to keep the stored one; the current key is shown masked (`sk-…abcd`).
