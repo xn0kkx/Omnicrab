@@ -5,11 +5,12 @@ use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Bar, BarChart, BarGroup, Block, Clear, Gauge, Paragraph, Row, Sparkline, Table, TableState,
-    Tabs, Wrap,
+    Bar, BarChart, BarGroup, Block, Clear, Gauge, LineGauge, Paragraph, Row, Sparkline, Table,
+    TableState, Tabs, Wrap,
 };
 
 use super::app::*;
+use super::crab;
 use super::form::{Form, FormKind};
 use crate::model::*;
 use crate::usage::Window;
@@ -104,17 +105,19 @@ fn draw_main(f: &mut Frame, app: &App) {
         Constraint::Length(1),
     ])
     .areas(f.area());
-    let titles: Vec<String> = Tab::ALL
-        .iter()
-        .enumerate()
-        .map(|(i, t)| format!("{} {}", i + 1, t.title()))
-        .collect();
+    let titles: Vec<String> = Tab::ALL.iter().map(|t| t.label()).collect();
     f.render_widget(
         Tabs::new(titles)
             .select(app.tab.index())
             .block(
                 Block::bordered()
                     .title(" 🦀 omnicrab ".fg(ACCENT).bold())
+                    .title(
+                        Line::from(
+                            " Ctrl+P switch · Ctrl+←/→ prev/next · click ".fg(Color::DarkGray),
+                        )
+                        .right_aligned(),
+                    )
                     .border_style(DIM),
             )
             .highlight_style(Style::new().fg(ACCENT).bold().underlined()),
@@ -149,6 +152,7 @@ fn draw_main(f: &mut Frame, app: &App) {
             );
         }
         Some(Modal::Help) => draw_help(f),
+        Some(Modal::Switcher(sel)) => draw_switcher(f, *sel, app.tab),
         None => {}
     }
 }
@@ -210,10 +214,39 @@ fn wrapped_height(text: &str, width: usize) -> usize {
         .sum()
 }
 
+fn draw_crab(f: &mut Frame, app: &App, area: Rect) {
+    let running = app.active_runs > 0;
+    let (pose, offset) = crab::frame(app.tick, running, area.width as usize);
+    let pad = " ".repeat(offset);
+    let style = Style::new().fg(if running {
+        ACCENT
+    } else {
+        Color::Rgb(150, 80, 45)
+    });
+    let lines: Vec<Line> = pose
+        .iter()
+        .map(|l| Line::from(Span::styled(format!("{pad}{l}"), style)))
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let in_lines = app.input.split('\n').count().clamp(1, 6) as u16;
-    let [msgs, input] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(in_lines + 2)]).areas(area);
+    // The crab needs its own strip; skip it on short terminals.
+    let crab_h = if area.height >= 18 {
+        crab::HEIGHT as u16
+    } else {
+        0
+    };
+    let [msgs, crab_a, input] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(crab_h),
+        Constraint::Length(in_lines + 2),
+    ])
+    .areas(area);
+    if crab_h > 0 {
+        draw_crab(f, app, crab_a);
+    }
 
     let mut lines: Vec<Line> = vec![];
     if app.entries.is_empty() {
@@ -531,8 +564,14 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------- usage
 
 fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
-    let [top, bottom] =
-        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
+    let limits_h = app.accounts.len().clamp(1, 6) as u16 + 2;
+    let [top, limits, bottom] = Layout::vertical([
+        Constraint::Percentage(35),
+        Constraint::Length(limits_h),
+        Constraint::Min(8),
+    ])
+    .areas(area);
+    draw_limits(f, app, limits);
     let w = app.window;
     let rows: Vec<Row> = app
         .accounts
@@ -583,7 +622,7 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
         table_block(
             &format!("Usage - {}  (total {})", w.label(), money(total)),
             &format!(
-                "t window ({}) · r refresh · ↑↓ select",
+                "t window ({}) · r refresh · p probe limits · ↑↓ select",
                 Window::ALL
                     .iter()
                     .map(|x| x.label())
@@ -681,7 +720,133 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn pct_color(r: f64) -> Color {
+    if r > 0.9 {
+        Color::Red
+    } else if r > 0.7 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn until(now: chrono::DateTime<chrono::Utc>, t: chrono::DateTime<chrono::Utc>) -> String {
+    let m = (t - now).num_minutes().max(0);
+    match m {
+        0..=59 => format!("{m}m"),
+        60..=1439 => format!("{}h{:02}m", m / 60, m % 60),
+        _ => format!("{}d {}h", m / 1440, m % 1440 / 60),
+    }
+}
+
+fn limit_gauge(
+    label: &str,
+    w: Option<&LimitWindow>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> LineGauge<'static> {
+    use crate::usage::LimitState;
+    let (ratio, text, color) = match w.map(|w| LimitState::of(w, now)) {
+        Some(LimitState::Active { used, resets_at }) => (
+            used.clamp(0.0, 1.0),
+            format!("{label} {:>3.0}% ↻{}", used * 100.0, until(now, resets_at)),
+            pct_color(used),
+        ),
+        Some(LimitState::Reset) => (0.0, format!("{label}   0% (reset)"), Color::Green),
+        None => (0.0, format!("{label}  --"), Color::DarkGray),
+    };
+    LineGauge::default()
+        .ratio(ratio)
+        .label(text)
+        .filled_style(Style::new().fg(color))
+        .unfilled_style(DIM)
+}
+
+/// Plan-limit usage (5-hour and weekly windows) per account.
+fn draw_limits(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::bordered()
+        .title(" Plan limits - 5h / weekly ")
+        .title(Line::from(" Claude CLI accounts · p refresh ".fg(Color::DarkGray)).right_aligned())
+        .border_style(DIM);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if app.accounts.is_empty() {
+        f.render_widget(Paragraph::new("no accounts yet".fg(Color::DarkGray)), inner);
+        return;
+    }
+    for (i, a) in app.accounts.iter().take(inner.height as usize).enumerate() {
+        let row = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        let [name, g5, g7, age] = Layout::horizontal([
+            Constraint::Length(20),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(12),
+        ])
+        .areas(row);
+        let style = if i == app.sel[3] {
+            Style::new().fg(ACCENT).bold()
+        } else {
+            Style::new()
+        };
+        let n: String = a.name.chars().take(19).collect();
+        f.render_widget(Paragraph::new(Span::styled(n, style)), name);
+        if a.kind != ProviderKind::ClaudeCli {
+            f.render_widget(
+                Paragraph::new("n/a (no plan limits reported)".fg(Color::DarkGray)),
+                g5,
+            );
+            continue;
+        }
+        match app.usage.get(&a.id).and_then(|u| u.limits.as_ref()) {
+            Some((l, at)) => {
+                f.render_widget(limit_gauge("5h", l.five_hour.as_ref(), app.now), g5);
+                f.render_widget(limit_gauge("7d", l.seven_day.as_ref(), app.now), g7);
+                f.render_widget(
+                    Paragraph::new(format!(" {} ago", until(*at, app.now)).fg(Color::DarkGray)),
+                    age,
+                );
+            }
+            None => f.render_widget(
+                Paragraph::new("no data yet - send a message or press p".fg(Color::DarkGray)),
+                g5,
+            ),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- modals
+
+fn draw_switcher(f: &mut Frame, sel: usize, current: Tab) {
+    let a = centered(f.area(), 34, Tab::ALL.len() as u16 + 4);
+    f.render_widget(Clear, a);
+    let mut lines: Vec<Line> = Tab::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mark = if *t == current { "•" } else { " " };
+            let style = if i == sel {
+                Style::new().bg(ACCENT).fg(Color::Black).bold()
+            } else {
+                Style::new()
+            };
+            Line::from(Span::styled(
+                format!(" {mark} [{}] {:<10} {}", t.mnemonic(), t.title(), i + 1),
+                style,
+            ))
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(
+        " letter/number · ↑↓ Enter · Esc".fg(Color::DarkGray),
+    ));
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Go to ")
+                .border_style(Style::new().fg(ACCENT)),
+        ),
+        a,
+    );
+}
 
 fn draw_form(f: &mut Frame, form: &Form) {
     let vis = form.visible_indices();
@@ -753,11 +918,16 @@ fn draw_form(f: &mut Frame, form: &Form) {
 }
 
 fn draw_help(f: &mut Frame) {
-    let a = centered(f.area(), 84, 30);
+    let a = centered(f.area(), 84, 33);
     f.render_widget(Clear, a);
     let mut t: Vec<Line> = vec![
         Line::from("Keys".fg(ACCENT).bold()),
-        Line::raw("  F1-F5 / Tab     switch tabs         Ctrl+N new session     Ctrl+L lock vault"),
+        Line::raw(
+            "  Ctrl+P          quick tab switcher (c/a/g/u/s or 1-5)   Ctrl+←/→ prev/next tab",
+        ),
+        Line::raw("  F1-F5 / Tab     switch tabs · click a tab with the mouse"),
+        Line::raw("  Ctrl+N          new session         Ctrl+L lock vault"),
+        Line::raw("  Usage tab:      t window · r reload · p refresh plan limits of the account"),
         Line::raw("  Esc             cancel running requests · Ctrl+C cancel, or quit when idle"),
         Line::raw("  PgUp/PgDn       scroll chat         Alt+Enter newline in message"),
         Line::raw(

@@ -18,6 +18,17 @@
 | **Usage** | Per-account consumption and costs. |
 | **Sessions** | Resume or delete saved conversations. |
 
+Switching tabs (works from anywhere, including the chat box; `Alt` is deliberately not used because terminals use it for their own tabs):
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+P` | Quick switcher: press `c` Chat, `a` Accounts, `g` Agents, `u` Usage, `s` Sessions (or `1`–`5`, or `↑/↓` + `Enter`). `Esc` closes it. |
+| `Ctrl+←` / `Ctrl+→` | Previous / next tab |
+| Mouse click | Click a tab title in the top bar |
+| `F1`–`F5` | Jump to a tab |
+| `Tab` / `Shift+Tab` | Next / previous tab in list tabs (in Chat, `Tab` completes `/` and `@` first) |
+| `1`–`5` | Jump to a tab from list tabs |
+
 Lists share navigation keys: `↑/↓` or `j/k` to move, `Esc` to return to Chat, `?` for help.
 
 ### Accounts tab
@@ -48,6 +59,7 @@ An agent has:
 
 ### Usage tab
 
+- **Plan limits** panel: for each Claude Code CLI account, how much of the **5-hour** and **weekly** subscription limits is used (bar, percentage, time until the window resets) and how old that reading is. Accounts of other kinds show `n/a`. See [how the numbers are obtained](providers.md#plan-limits-5-hour-and-weekly). `p` sends a tiny prompt to the selected Claude account to refresh its reading.
 - Table: requests, errors, input/output tokens and cost for the selected window. `t` cycles *today → 7d → 30d → all*; `r` refreshes.
 - Sparkline: tokens per day for the last 30 days for the selected account.
 - Gauge: month spend against the account's budget (green < 70 %, yellow < 90 %, red above).
@@ -59,6 +71,7 @@ Cost is computed from the [price table](providers.md#pricing); CLI accounts use 
 
 - `Enter` sends, `Alt+Enter` (or `Ctrl+J`) inserts a newline, `Esc` clears the box or cancels running requests. `Ctrl+H` works as Backspace for terminals that send `^H`. The mouse wheel and `PageUp`/`PageDown` scroll the chat; hold `Shift` while dragging to select text (mouse capture is on).
 - Typing `/` or `@` opens a completion popup; `Tab` completes.
+- A small crab sits above the message box. While a request is running it scuttles from side to side and snaps its claws; when idle it rests (and blinks). It is hidden on very short terminals (< 18 rows).
 - The status bar shows the active target, model override, session tokens/cost and a spinner while requests run.
 
 ### Routing

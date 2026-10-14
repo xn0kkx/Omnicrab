@@ -30,6 +30,8 @@ pub struct TokenUsage {
     pub output: u64,
     /// Cost reported by the provider itself (CLIs). `None` => compute from price table.
     pub reported_cost_usd: Option<f64>,
+    /// Plan limits reported by the CLI during the request.
+    pub rate_limits: Option<crate::model::RateLimits>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,7 +39,10 @@ pub enum ProviderEvent {
     Delta(String),
     /// Tool activity (e.g. a web search); shown as a note, not as answer text.
     Note(String),
-    Done { usage: TokenUsage, model: String },
+    Done {
+        usage: TokenUsage,
+        model: String,
+    },
     Error(ProviderError),
 }
 

@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::crypto::Vault;
-use crate::model::{Account, UsageEvent, UsageStatus};
+use crate::model::{Account, RateLimits, UsageEvent, UsageStatus};
 use crate::providers::{self, ChatRequest, ProviderEvent};
 use crate::store::Store;
 use crate::usage::{PriceTable, start_of_month};
@@ -120,6 +120,7 @@ impl Core {
                     return Err("cancelled".into());
                 }
                 Some(Ok((u, model))) => {
+                    let limits = u.rate_limits.clone();
                     let cost = u
                         .reported_cost_usd
                         .unwrap_or_else(|| self.prices.cost(&acct, &model, u.input, u.output));
@@ -131,6 +132,7 @@ impl Core {
                         cost,
                         latency_ms,
                         UsageStatus::Ok,
+                        limits,
                     )
                     .await;
                     send(RunEvent::Finished {
@@ -171,6 +173,23 @@ impl Core {
         Err(last_err)
     }
 
+    /// Sends a minimal prompt to one account so its usage (and, for Claude
+    /// CLI accounts, its plan limits) gets recorded.
+    pub async fn probe(&self, acct: Account) -> Result<(), String> {
+        let req = ChatRequest {
+            system: None,
+            turns: vec![providers::ChatTurn {
+                role: crate::model::Role::User,
+                content: "Reply with the single word: ok".into(),
+            }],
+            model: None,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        self.run(0, vec![acct], req, CancellationToken::new(), tx)
+            .await
+            .map(|_| ())
+    }
+
     async fn month_spend(&self) -> std::collections::HashMap<uuid::Uuid, f64> {
         let events = self
             .store
@@ -200,7 +219,7 @@ impl Core {
             .clone()
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| a.model.clone());
-        self.record_model(a, &model, i, o, cost, ms, st).await
+        self.record_model(a, &model, i, o, cost, ms, st, None).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -213,6 +232,7 @@ impl Core {
         cost: f64,
         ms: u64,
         st: UsageStatus,
+        rate_limits: Option<RateLimits>,
     ) {
         let ev = UsageEvent {
             model: model.to_string(),
@@ -221,6 +241,7 @@ impl Core {
             cost_usd: cost,
             latency_ms: ms,
             status: st,
+            rate_limits,
             at: Utc::now(),
             account_id: a.id,
         };

@@ -262,6 +262,45 @@ pub enum UsageStatus {
     FailedOver,
 }
 
+/// One subscription rate-limit window (e.g. the 5-hour or 7-day one).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LimitWindow {
+    /// Fraction of the window used (0.0..=1.0, may exceed 1.0 with overage).
+    pub utilization: f64,
+    pub resets_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Plan limits as reported by a provider CLI alongside a response.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimits {
+    #[serde(default)]
+    pub five_hour: Option<LimitWindow>,
+    #[serde(default)]
+    pub seven_day: Option<LimitWindow>,
+    /// "allowed", "allowed_warning" or "rejected".
+    #[serde(default)]
+    pub status: String,
+}
+
+impl RateLimits {
+    pub fn is_empty(&self) -> bool {
+        self.five_hour.is_none() && self.seven_day.is_none()
+    }
+
+    /// Fills in windows that `newer` knows about, keeping the rest.
+    pub fn merge(&mut self, newer: RateLimits) {
+        if newer.five_hour.is_some() {
+            self.five_hour = newer.five_hour;
+        }
+        if newer.seven_day.is_some() {
+            self.seven_day = newer.seven_day;
+        }
+        if !newer.status.is_empty() {
+            self.status = newer.status;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsageEvent {
     pub model: String,
@@ -270,6 +309,9 @@ pub struct UsageEvent {
     pub cost_usd: f64,
     pub latency_ms: u64,
     pub status: UsageStatus,
+    /// Plan limits seen during this request (Claude CLI only).
+    #[serde(default)]
+    pub rate_limits: Option<RateLimits>,
     #[serde(skip, default = "chrono::Utc::now")]
     pub at: chrono::DateTime<chrono::Utc>,
     #[serde(skip, default = "Uuid::nil")]

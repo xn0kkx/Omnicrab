@@ -34,8 +34,8 @@ omnicrab is a single Rust binary. The UI never calls providers directly: it talk
 | `src/providers/` | `stream_chat`, `complete`, `test_connection`; HTTP and CLI backends |
 | `src/orchestrator/mod.rs` | `Core::run`: failover chain, budgets, usage recording |
 | `src/orchestrator/modes.rs` | Fan-out and plan → workers → synthesis |
-| `src/usage.rs` | Price table, time windows, aggregation |
-| `src/tui/` | `app` (state/events), `ui` (rendering), `form` (modal forms) |
+| `src/usage.rs` | Price table, time windows, aggregation, latest plan-limit snapshot per account |
+| `src/tui/` | `app` (state/events), `ui` (rendering), `form` (modal forms), `crab` (chat mascot animation) |
 
 ## Event flow for one chat message
 
@@ -67,3 +67,5 @@ A **lane** is one logical request. Chat uses one lane; `/fanout` one per account
 | `usage_events` | `id`, `account_id`, `created_at` | model, tokens, cost, latency, status |
 
 Usage is aggregated in memory after decryption, which is fine at personal scale.
+
+`usage_events` payloads may also carry `rate_limits` (5-hour / weekly utilization and reset times). It lives inside the encrypted blob, so it needs no migration; older events simply lack it. The value travels from the CLI parser through `TokenUsage.rate_limits` to `Core::record_model`.

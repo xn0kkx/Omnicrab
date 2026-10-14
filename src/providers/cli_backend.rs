@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{ChatRequest, ProviderError, ProviderEvent, TokenUsage, which};
-use crate::model::{Account, ProviderKind, Role};
+use crate::model::{Account, LimitWindow, ProviderKind, RateLimits, Role};
 
 /// CLIs are single-prompt, so history is flattened into a transcript.
 fn flatten(req: &ChatRequest) -> String {
@@ -200,10 +200,45 @@ struct Parsed {
     model: Option<String>,
     /// Tool activity, e.g. "web search: query".
     note: Option<String>,
+    /// Subscription plan limits (Claude only).
+    limits: Option<RateLimits>,
 }
 
 fn u(v: &Value, k: &str) -> u64 {
     v.get(k).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn limit_window(v: &Value, fallback_reset: Option<i64>) -> Option<LimitWindow> {
+    let utilization = v.get("utilization")?.as_f64()?;
+    let secs = v
+        .get("resetsAt")
+        .and_then(Value::as_i64)
+        .or(fallback_reset)?;
+    Some(LimitWindow {
+        utilization,
+        resets_at: chrono::DateTime::from_timestamp(secs, 0)?,
+    })
+}
+
+/// Reads the `rate_limit_info` of a Claude `rate_limit_event`. Prefers the
+/// per-window map; falls back to the single window named by `rateLimitType`.
+fn parse_rate_limits(info: &Value) -> Option<RateLimits> {
+    let mut r = RateLimits {
+        status: info["status"].as_str().unwrap_or_default().to_string(),
+        ..Default::default()
+    };
+    let w = &info["unifiedWindows"];
+    r.five_hour = limit_window(&w["five_hour"], None);
+    r.seven_day = limit_window(&w["seven_day"], None);
+    if r.is_empty() {
+        let top = limit_window(info, info["resetsAt"].as_i64());
+        match info["rateLimitType"].as_str() {
+            Some("five_hour") => r.five_hour = top,
+            Some("seven_day") => r.seven_day = top,
+            _ => {}
+        }
+    }
+    (!r.is_empty()).then_some(r)
 }
 
 fn tool_note(b: &Value) -> String {
@@ -244,6 +279,7 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
                 }
                 p.model = v["message"]["model"].as_str().map(str::to_string);
             }
+            "rate_limit_event" => p.limits = parse_rate_limits(&v["rate_limit_info"]),
             "result" => {
                 if v["is_error"].as_bool().unwrap_or(false) {
                     p.error = Some(
@@ -260,6 +296,7 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
                             + u(us, "cache_creation_input_tokens"),
                         output: u(us, "output_tokens"),
                         reported_cost_usd: v["total_cost_usd"].as_f64(),
+                        ..Default::default()
                     });
                 }
             }
@@ -275,6 +312,7 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
                     input: u(us, "input_tokens"),
                     output: u(us, "output_tokens"),
                     reported_cost_usd: None,
+                    ..Default::default()
                 });
             }
             "turn.failed" | "error" => {
@@ -303,6 +341,7 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
                         input: u(&r["usage"], "input_tokens"),
                         output: u(&r["usage"], "output_tokens"),
                         reported_cost_usd: None,
+                        ..Default::default()
                     });
                 } else {
                     let msg = r["error"]
@@ -335,6 +374,7 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
                         input: u(st, "input_tokens").max(u(st, "input")),
                         output: u(st, "output_tokens"),
                         reported_cost_usd: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -382,6 +422,7 @@ pub async fn stream(
     let (mut streamed, mut last_full) = (false, None::<String>);
     let mut after_tool = false;
     let (mut usage, mut model, mut error) = (None::<TokenUsage>, None::<String>, None::<String>);
+    let mut limits = RateLimits::default();
     loop {
         let line = tokio::select! {
             _ = cancel.cancelled() => { let _ = child.kill().await; return; }
@@ -418,6 +459,9 @@ pub async fn stream(
                 let _ = tx.send(ProviderEvent::Delta(p.full.clone().unwrap())).await;
             }
             last_full = p.full;
+        }
+        if let Some(l) = p.limits {
+            limits.merge(l);
         }
         usage = p.usage.or(usage);
         model = p.model.or(model);
@@ -457,12 +501,9 @@ pub async fn stream(
             account.model.clone()
         }
     });
-    let _ = tx
-        .send(ProviderEvent::Done {
-            usage: usage.unwrap_or_default(),
-            model,
-        })
-        .await;
+    let mut usage = usage.unwrap_or_default();
+    usage.rate_limits = (!limits.is_empty()).then_some(limits);
+    let _ = tx.send(ProviderEvent::Done { usage, model }).await;
 }
 
 #[cfg(test)]
@@ -492,6 +533,25 @@ mod tests {
         assert_eq!(get("ANTHROPIC_API_KEY"), Some(None));
         assert!(dir.is_dir());
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn claude_rate_limit_event() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1792001400,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.54,"resetsAt":1792001400},"seven_day":{"utilization":0.64,"resetsAt":1792126800}}}}"#;
+        let l = parse_line(ProviderKind::ClaudeCli, line).limits.unwrap();
+        assert_eq!(l.status, "allowed");
+        assert_eq!(l.five_hour.unwrap().utilization, 0.54);
+        assert_eq!(l.seven_day.unwrap().resets_at.timestamp(), 1792126800);
+
+        // Only the top-level window: falls back to `rateLimitType`.
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1792126800,"rateLimitType":"seven_day","utilization":0.9}}"#;
+        let l = parse_line(ProviderKind::ClaudeCli, line).limits.unwrap();
+        assert!(l.five_hour.is_none());
+        assert_eq!(l.seven_day.unwrap().utilization, 0.9);
+
+        // Nothing usable.
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
+        assert!(parse_line(ProviderKind::ClaudeCli, line).limits.is_none());
     }
 
     #[test]

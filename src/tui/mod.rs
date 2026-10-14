@@ -1,4 +1,5 @@
 pub mod app;
+pub mod crab;
 pub mod form;
 pub mod ui;
 

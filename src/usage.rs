@@ -6,7 +6,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use uuid::Uuid;
 
 use crate::config::Price;
-use crate::model::{Account, UsageEvent, UsageStatus};
+use crate::model::{Account, RateLimits, UsageEvent, UsageStatus};
 
 #[derive(Clone, Debug)]
 pub struct PriceTable(Vec<(String, Price)>);
@@ -131,6 +131,30 @@ pub struct AccountUsage {
     pub month_cost: f64,
     /// Tokens per day for the last 30 days, oldest first.
     pub daily_tokens: Vec<u64>,
+    /// Latest plan limits seen for the account and when they were observed.
+    pub limits: Option<(RateLimits, DateTime<Utc>)>,
+}
+
+/// How much of a plan-limit window is in use right now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LimitState {
+    /// Still counting: fraction used and when it resets.
+    Active { used: f64, resets_at: DateTime<Utc> },
+    /// The window ended after the snapshot, so usage is back to ~0.
+    Reset,
+}
+
+impl LimitState {
+    pub fn of(w: &crate::model::LimitWindow, now: DateTime<Utc>) -> Self {
+        if w.resets_at <= now {
+            Self::Reset
+        } else {
+            Self::Active {
+                used: w.utilization,
+                resets_at: w.resets_at,
+            }
+        }
+    }
 }
 
 impl AccountUsage {
@@ -152,7 +176,9 @@ pub fn aggregate(events: &[UsageEvent], now: DateTime<Utc>) -> HashMap<Uuid, Acc
         Window::Days30.since(now).unwrap(),
         start_of_month(now),
     );
-    for e in events {
+    let mut by_time: Vec<&UsageEvent> = events.iter().collect();
+    by_time.sort_by_key(|e| e.at);
+    for e in by_time {
         let u = map.entry(e.account_id).or_insert_with(|| AccountUsage {
             daily_tokens: vec![0; 30],
             ..Default::default()
@@ -173,6 +199,15 @@ pub fn aggregate(events: &[UsageEvent], now: DateTime<Utc>) -> HashMap<Uuid, Acc
         }
         if e.at >= m0 {
             u.month_cost += e.cost_usd;
+        }
+        if let Some(l) = e.rate_limits.clone().filter(|l| !l.is_empty()) {
+            match &mut u.limits {
+                Some((cur, at)) => {
+                    cur.merge(l);
+                    *at = e.at;
+                }
+                None => u.limits = Some((l, e.at)),
+            }
         }
     }
     map
@@ -252,6 +287,7 @@ mod tests {
             cost_usd: cost,
             latency_ms: 1,
             status: UsageStatus::Ok,
+            rate_limits: None,
             at: now - ago,
             account_id: id,
         };
@@ -268,5 +304,49 @@ mod tests {
         assert_eq!(a.all.requests, 4);
         assert_eq!(a.daily_tokens.len(), 30);
         assert_eq!(a.daily_tokens.iter().sum::<u64>(), 45);
+    }
+
+    #[test]
+    fn limits_use_latest_snapshot_and_expire() {
+        use crate::model::LimitWindow;
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        let win = |u: f64, in_h: i64| LimitWindow {
+            utilization: u,
+            resets_at: now + Duration::hours(in_h),
+        };
+        let ev = |ago: Duration, l: RateLimits| UsageEvent {
+            model: "m".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+            latency_ms: 1,
+            status: UsageStatus::Ok,
+            rate_limits: Some(l),
+            at: now - ago,
+            account_id: id,
+        };
+        let old = RateLimits {
+            five_hour: Some(win(0.1, 2)),
+            seven_day: Some(win(0.2, 50)),
+            status: "allowed".into(),
+        };
+        let new = RateLimits {
+            five_hour: Some(win(0.5, 3)),
+            seven_day: None,
+            status: "allowed".into(),
+        };
+        // Deliberately out of order: the newer event must win per window.
+        let evs = vec![ev(Duration::minutes(1), new), ev(Duration::hours(1), old)];
+        let (l, at) = aggregate(&evs, now)[&id].limits.clone().unwrap();
+        assert_eq!(l.five_hour.unwrap().utilization, 0.5);
+        assert_eq!(l.seven_day.unwrap().utilization, 0.2);
+        assert_eq!(at, now - Duration::minutes(1));
+
+        assert!(matches!(
+            LimitState::of(&win(0.9, 1), now),
+            LimitState::Active { .. }
+        ));
+        assert_eq!(LimitState::of(&win(0.9, -1), now), LimitState::Reset);
     }
 }

@@ -61,6 +61,14 @@ Flow for a second Claude account: add an account of kind *Claude Code CLI*, set 
 
 For Claude accounts omnicrab also removes `ANTHROPIC_API_KEY` from the subprocess environment, because in `-p` mode an API key would otherwise take precedence over the subscription.
 
+### Plan limits (5-hour and weekly)
+
+The Claude Code CLI prints a `rate_limit_event` in its `stream-json` output whenever it talks to the API. It contains the fraction used and the reset time of the 5-hour and 7-day subscription windows (`unifiedWindows.five_hour` / `seven_day`, taken from Anthropic's `anthropic-ratelimit-unified-*` response headers). omnicrab reads that event, stores the latest values inside the encrypted usage record, and shows them in the **Usage** tab. Nothing extra is requested and no credentials are read.
+
+- Only Claude Code CLI accounts report this. Other providers have no equivalent and show `n/a`.
+- The reading is a snapshot from the last request. If a window's reset time has passed, it is shown as `0% (reset)`. Press `p` in the Usage tab to refresh it.
+- The event is not a documented, stable interface. The parser ignores anything it does not recognize, so a format change makes the panel show `no data` instead of failing requests.
+
 ## Pricing
 
 Cost for API accounts = `tokens_in × input + tokens_out × output` per 1M tokens, looked up by the **longest model-name prefix** in:

@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::Utc;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
@@ -52,6 +52,34 @@ impl Tab {
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|t| *t == self).unwrap()
     }
+    /// Text of the tab bar entry, e.g. "4 Usage".
+    pub fn label(self) -> String {
+        format!("{} {}", self.index() + 1, self.title())
+    }
+    /// Single-letter shortcut used by the quick switcher (`Ctrl+P`).
+    pub fn mnemonic(self) -> char {
+        match self {
+            Tab::Chat => 'c',
+            Tab::Accounts => 'a',
+            Tab::Agents => 'g',
+            Tab::Usage => 'u',
+            Tab::Sessions => 's',
+        }
+    }
+    /// Which tab sits under screen column `col` of the tab bar. Mirrors how
+    /// `ratatui::widgets::Tabs` lays titles out: 1 column of border, then
+    /// each title padded by one space on both sides, separated by one divider.
+    pub fn at_column(col: u16) -> Option<Tab> {
+        let mut x = 1u16;
+        for t in Self::ALL {
+            let w = t.label().chars().count() as u16 + 2;
+            if (x..x + w).contains(&col) {
+                return Some(t);
+            }
+            x += w + 1;
+        }
+        None
+    }
 }
 
 pub struct UnlockState {
@@ -71,8 +99,13 @@ pub enum Screen {
 
 pub enum Modal {
     Form(Form),
-    Confirm { text: String, action: ConfirmAction },
+    Confirm {
+        text: String,
+        action: ConfirmAction,
+    },
     Help,
+    /// Quick tab switcher (`Ctrl+P`); holds the highlighted tab index.
+    Switcher(usize),
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -160,6 +193,8 @@ pub struct App {
     pub lane_tx: mpsc::UnboundedSender<(LaneId, RunEvent)>,
     pub quit: bool,
     pub tick: u64,
+    /// Wall clock sampled on every tick, so rendering stays a pure function of `App`.
+    pub now: chrono::DateTime<Utc>,
     /// Set by `L`; the run loop suspends the TUI and runs it on the real terminal.
     pending_login: Option<(std::process::Command, Account)>,
 }
@@ -252,6 +287,7 @@ impl App {
             lane_tx,
             quit: false,
             tick: 0,
+            now: Utc::now(),
             pending_login: None,
         };
         Ok((app, rx, lane_rx))
@@ -295,6 +331,7 @@ impl App {
                             MouseEventKind::ScrollDown => {
                                 self.scroll_up = self.scroll_up.saturating_sub(3)
                             }
+                            MouseEventKind::Down(MouseButton::Left) => self.on_click(m.column, m.row),
                             _ => {}
                         },
                         Some(Err(e)) => return Err(e.into()),
@@ -303,7 +340,12 @@ impl App {
                     },
                     Some(m) = rx.recv() => self.on_msg(m),
                     Some((lane, ev)) = lane_rx.recv() => self.on_lane(lane, ev),
-                    _ = ticker.tick() => self.tick = self.tick.wrapping_add(1),
+                    _ = ticker.tick() => {
+                        self.tick = self.tick.wrapping_add(1);
+                        if self.tick.is_multiple_of(7) {
+                            self.now = Utc::now();
+                        }
+                    }
                 }
             }
             Ok(())
@@ -615,6 +657,18 @@ impl App {
                 self.on_tab_enter();
                 return;
             }
+            KeyCode::Right if ctrl => {
+                self.step_tab(1);
+                return;
+            }
+            KeyCode::Left if ctrl => {
+                self.step_tab(-1);
+                return;
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.modal = Some(Modal::Switcher(self.tab.index()));
+                return;
+            }
             KeyCode::Char('n') if ctrl => {
                 self.new_session();
                 return;
@@ -637,14 +691,8 @@ impl App {
                 self.tab = Tab::ALL[c as usize - '1' as usize];
                 self.on_tab_enter();
             }
-            KeyCode::Tab => {
-                self.tab = Tab::ALL[(self.tab.index() + 1) % 5];
-                self.on_tab_enter();
-            }
-            KeyCode::BackTab => {
-                self.tab = Tab::ALL[(self.tab.index() + 4) % 5];
-                self.on_tab_enter();
-            }
+            KeyCode::Tab => self.step_tab(1),
+            KeyCode::BackTab => self.step_tab(-1),
             KeyCode::Esc => self.tab = Tab::Chat,
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
@@ -660,12 +708,61 @@ impl App {
                         self.window = Window::ALL[(i + 1) % 4];
                     } else if k.code == KeyCode::Char('r') {
                         self.reload();
+                    } else if k.code == KeyCode::Char('p') {
+                        self.probe_selected();
                     }
                 }
                 Tab::Sessions => self.on_key_sessions(k),
                 Tab::Chat => {}
             },
         }
+    }
+
+    fn goto_tab(&mut self, t: Tab) {
+        self.tab = t;
+        self.on_tab_enter();
+    }
+
+    fn step_tab(&mut self, d: isize) {
+        let n = Tab::ALL.len() as isize;
+        let i = (self.tab.index() as isize + d).rem_euclid(n);
+        self.goto_tab(Tab::ALL[i as usize]);
+    }
+
+    fn on_click(&mut self, col: u16, row: u16) {
+        // The tab bar is a 3-row bordered block at the top of the main screen.
+        if !matches!(self.screen, Screen::Main) || self.modal.is_some() || row > 2 {
+            return;
+        }
+        if let Some(t) = Tab::at_column(col) {
+            self.goto_tab(t);
+        }
+    }
+
+    /// Sends a tiny prompt to the account selected in Usage so its plan
+    /// limits are refreshed (only Claude CLI accounts report them).
+    fn probe_selected(&mut self) {
+        let (Some(core), Some(a)) = (
+            self.core.clone(),
+            self.accounts.get(self.sel[Tab::Usage.index()]).cloned(),
+        ) else {
+            return;
+        };
+        if a.kind != ProviderKind::ClaudeCli {
+            self.notice = Some(format!("'{}' does not report plan limits", a.name));
+            return;
+        }
+        self.notice = Some(format!("refreshing limits for '{}'...", a.name));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let msg = match core.probe(a.clone()).await {
+                Ok(()) => format!("limits refreshed for '{}'", a.name),
+                Err(e) => format!("probe failed: {}", e.lines().next().unwrap_or("")),
+            };
+            let _ = tx.send(Msg::Notice(msg));
+            let _ = tx.send(Msg::RunDone);
+        });
+        self.active_runs += 1;
     }
 
     fn on_tab_enter(&mut self) {
@@ -1265,6 +1362,28 @@ impl App {
         match self.modal.take() {
             None => {}
             Some(Modal::Help) => { /* any key closes */ }
+            Some(Modal::Switcher(sel)) => {
+                let n = Tab::ALL.len();
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                let target = match k.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Char('p') if ctrl => return,
+                    KeyCode::Enter => Some(Tab::ALL[sel]),
+                    KeyCode::Char(c @ '1'..='5') => Some(Tab::ALL[c as usize - '1' as usize]),
+                    KeyCode::Char(c) if !ctrl => Tab::ALL.into_iter().find(|t| t.mnemonic() == c),
+                    _ => None,
+                };
+                match (target, k.code) {
+                    (Some(t), _) => self.goto_tab(t),
+                    (None, KeyCode::Down | KeyCode::Right | KeyCode::Char('j')) => {
+                        self.modal = Some(Modal::Switcher((sel + 1) % n))
+                    }
+                    (None, KeyCode::Up | KeyCode::Left | KeyCode::Char('k')) => {
+                        self.modal = Some(Modal::Switcher((sel + n - 1) % n))
+                    }
+                    _ => self.modal = Some(Modal::Switcher(sel)),
+                }
+            }
             Some(Modal::Confirm { text, action }) => match k.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.confirm(action),
                 KeyCode::Char('n') | KeyCode::Esc => {}
@@ -1766,5 +1885,30 @@ impl App {
                 let _ = core.store.append_message(&core.vault, session, &m).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_bar_hit_testing() {
+        // "│ 1 Chat │ 2 Accounts │..." : border, then " 1 Chat " (8 cols), divider...
+        assert_eq!(Tab::at_column(0), None);
+        assert_eq!(Tab::at_column(1), Some(Tab::Chat));
+        assert_eq!(Tab::at_column(8), Some(Tab::Chat));
+        assert_eq!(Tab::at_column(9), None); // divider
+        assert_eq!(Tab::at_column(10), Some(Tab::Accounts));
+        assert_eq!(Tab::at_column(200), None);
+        for t in Tab::ALL {
+            assert_eq!(
+                Tab::ALL
+                    .iter()
+                    .filter(|x| x.mnemonic() == t.mnemonic())
+                    .count(),
+                1
+            );
+        }
     }
 }
