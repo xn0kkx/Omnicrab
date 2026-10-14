@@ -1,6 +1,7 @@
 pub mod app;
 pub mod crab;
 pub mod form;
+pub mod input;
 pub mod ui;
 
 use anyhow::Result;

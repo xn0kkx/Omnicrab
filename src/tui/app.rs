@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::form::{Field, FieldId, Form, FormKind};
+use super::input::InputBuf;
 use crate::crypto::{KdfParams, Vault, VaultHeader};
 use crate::model::*;
 use crate::orchestrator::{Core, LaneId, RunEvent, balance, compact, modes};
@@ -236,6 +237,8 @@ pub enum Msg {
         base: LaneId,
     },
     Summary(compact::Summary),
+    /// Result of `/compact`: the summary and how many messages it folded.
+    Compacted(compact::Summary),
 }
 
 pub struct Loaded {
@@ -258,7 +261,7 @@ pub struct App {
     pub usage: HashMap<Uuid, AccountUsage>,
     pub window: Window,
     pub entries: Vec<Entry>,
-    pub input: String,
+    pub input: InputBuf,
     pub scroll_up: u16,
     pub sel: [usize; 6],
     pub modal: Option<Modal>,
@@ -317,6 +320,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/plan",
         "toggle plan mode (Shift+Tab cycles chat/plan/auto)",
     ),
+    (
+        "/compact",
+        "/compact [focus] - summarize older messages now",
+    ),
     ("/rename", "/rename <title> - rename this session"),
     ("/passwd", "change the master password"),
     ("/lock", "lock the vault"),
@@ -367,7 +374,7 @@ impl App {
             usage: HashMap::new(),
             window: Window::Days30,
             entries: vec![],
-            input: String::new(),
+            input: InputBuf::default(),
             scroll_up: 0,
             sel: [0; 6],
             modal: None,
@@ -560,6 +567,20 @@ impl App {
                 self.notice = Some("review the plan: Enter approves, Esc discards".into());
             }
             Msg::Summary(s) => self.summary = Some(s),
+            Msg::Compacted(s) => {
+                let mut e = Entry::new(
+                    Role::System,
+                    "compact",
+                    format!(
+                        "Conversation compacted: {} earlier messages are now this summary.\n\n{}",
+                        s.covered, s.text
+                    ),
+                );
+                e.meta = "summary replaces them in later requests".into();
+                self.entries.push(e);
+                self.summary = Some(s);
+                self.scroll_up = 0;
+            }
             Msg::FormStatus(s) => {
                 if let Some(Modal::Form(f)) = &mut self.modal {
                     f.status = Some(s);
@@ -658,7 +679,16 @@ impl App {
                 let agents = core.store.list_agents(&core.vault).await?;
                 let sessions = core.store.list_sessions(&core.vault).await?;
                 let events = core.store.load_usage(&core.vault, None).await?;
-                let routing = core.store.load_setting(&core.vault, "routing").await?;
+                // A routing document that cannot be read (e.g. written by an older build)
+                // must not stop everything else from loading.
+                let routing = core
+                    .store
+                    .load_setting(&core.vault, "routing")
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("ignoring unreadable routing settings: {e:#}");
+                        None
+                    });
                 Ok(Loaded {
                     accounts,
                     agents,
@@ -950,6 +980,7 @@ impl App {
 
     fn on_key_chat(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
             KeyCode::Esc => {
                 if self.active_runs > 0 {
@@ -958,31 +989,46 @@ impl App {
                     self.input.clear();
                 }
             }
-            KeyCode::Enter
-                if k.modifiers.contains(KeyModifiers::ALT)
-                    || k.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
-                self.input.push('\n')
+            KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.input.insert('\n')
             }
-            KeyCode::Char('j') if ctrl => self.input.push('\n'),
-            KeyCode::Char('u') if ctrl => self.input.clear(),
+            KeyCode::Char('j') if ctrl => self.input.insert('\n'),
             KeyCode::Char('o') if ctrl => self.toggle_plan_mode(),
             KeyCode::BackTab => self.cycle_mode(),
             KeyCode::Enter => {
-                let text = std::mem::take(&mut self.input);
+                let text = self.input.take();
                 if !text.trim().is_empty() {
                     self.submit(text.trim().to_string());
                 }
             }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
+            // Editing, as in a readline prompt.
+            KeyCode::Left if alt => self.input.word_left(),
+            KeyCode::Right if alt => self.input.word_right(),
+            KeyCode::Char('b') if alt => self.input.word_left(),
+            KeyCode::Char('f') if alt => self.input.word_right(),
+            KeyCode::Backspace if alt => self.input.delete_word_back(),
+            KeyCode::Left if !ctrl => self.input.left(),
+            KeyCode::Right if !ctrl => self.input.right(),
+            KeyCode::Up => self.input.up(),
+            KeyCode::Down => self.input.down(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
+            KeyCode::Char('a') if ctrl => self.input.home(),
+            KeyCode::Char('e') if ctrl => self.input.end(),
+            KeyCode::Char('b') if ctrl => self.input.left(),
+            KeyCode::Char('f') if ctrl => self.input.right(),
+            KeyCode::Char('w') if ctrl => self.input.delete_word_back(),
+            KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
+            KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
+            KeyCode::Char('d') if ctrl => self.input.delete(),
+            KeyCode::Delete => self.input.delete(),
+            KeyCode::Backspace => self.input.backspace(),
             KeyCode::PageUp => self.scroll_up = self.scroll_up.saturating_add(8),
             KeyCode::PageDown => self.scroll_up = self.scroll_up.saturating_sub(8),
             KeyCode::Tab => {
-                if self.input.starts_with('/') || self.input.starts_with('@') {
+                if self.input.as_str().starts_with('/') || self.input.as_str().starts_with('@') {
                     if let Some(c) = self.completions().first() {
-                        self.input = format!("{} ", c.0);
+                        self.input.set(format!("{} ", c.0));
                     }
                 } else {
                     self.tab = Tab::Accounts;
@@ -990,14 +1036,14 @@ impl App {
                 }
             }
             KeyCode::Char('?') if self.input.is_empty() => self.modal = Some(Modal::Help),
-            KeyCode::Char(c) if !ctrl => self.input.push(c),
+            KeyCode::Char(c) if !ctrl && !alt => self.input.insert(c),
             _ => {}
         }
     }
 
     pub fn completions(&self) -> Vec<(String, String)> {
-        let first = self.input.split_whitespace().next().unwrap_or("");
-        if self.input.contains(' ') {
+        let first = self.input.as_str().split_whitespace().next().unwrap_or("");
+        if self.input.as_str().contains(' ') {
             return vec![];
         }
         if first.starts_with('/') {
@@ -1946,19 +1992,7 @@ impl App {
         }
 
         // History for the model (before adding this turn).
-        let mut turns: Vec<ChatTurn> = self
-            .entries
-            .iter()
-            .filter(|e| {
-                !e.failed
-                    && matches!(e.role, Role::User | Role::Assistant)
-                    && !e.text.trim().is_empty()
-            })
-            .map(|e| ChatTurn {
-                role: e.role,
-                content: e.text.clone(),
-            })
-            .collect();
+        let mut turns = self.history_turns();
         turns.push(ChatTurn {
             role: Role::User,
             content: prompt.clone(),
@@ -2003,6 +2037,8 @@ impl App {
             })
             .flatten();
         let prev = self.summary.clone();
+        // A summary made earlier (or by /compact) keeps applying to later requests.
+        let cut = cut.or(prev.as_ref().map(|p| p.covered));
         let msg_tx = self.tx.clone();
 
         self.push_user(&prompt);
@@ -2011,7 +2047,17 @@ impl App {
         self.spawn_run(move |core, cancel, ui, session| async move {
             let mut req = req;
             if let Some(cut) = cut {
-                let summary = compact_history(&core, &req, cut, prev, aux, &cancel, &msg_tx).await;
+                let summary = compact_history(
+                    &core,
+                    &req,
+                    cut,
+                    prev,
+                    aux,
+                    &cancel,
+                    &msg_tx,
+                    CompactOpts::default(),
+                )
+                .await;
                 if let Some(s) = summary {
                     req.turns = compact::apply(&req.turns, &s.text, s.covered);
                     let _ = msg_tx.send(Msg::Summary(s));
@@ -2027,6 +2073,22 @@ impl App {
                 let _ = core.store.append_message(&core.vault, session, &m).await;
             }
         });
+    }
+
+    /// Finished user/assistant messages of the current conversation.
+    fn history_turns(&self) -> Vec<ChatTurn> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                !e.failed
+                    && matches!(e.role, Role::User | Role::Assistant)
+                    && !e.text.trim().is_empty()
+            })
+            .map(|e| ChatTurn {
+                role: e.role,
+                content: e.text.clone(),
+            })
+            .collect()
     }
 
     fn push_user(&mut self, prompt: &str) {
@@ -2127,6 +2189,7 @@ impl App {
                 self.summary = None;
             }
             "plan" => self.toggle_plan_mode(),
+            "compact" => self.cmd_compact(rest),
             "quit" | "exit" | "q" => self.quit = true,
             "lock" => self.lock(),
             "passwd" => {
@@ -2244,6 +2307,63 @@ impl App {
                     account_name: Some(r.account),
                 };
                 let _ = core.store.append_message(&core.vault, session, &m).await;
+            }
+        });
+    }
+
+    /// `/compact [focus]`: fold older messages into a summary now, keeping the
+    /// first message and the last `keep_last_turns` verbatim.
+    fn cmd_compact(&mut self, focus: &str) {
+        let turns = self.history_turns();
+        let keep = self.routing.policy.keep_last_turns as usize;
+        let tail_start = turns.len().saturating_sub(keep.max(1));
+        if tail_start <= 1 {
+            self.notice = Some("nothing to compact yet".into());
+            return;
+        }
+        let cut = tail_start - 1;
+        let policy = self.routing.policy.clone();
+        let mut chain = if self.routing.auxiliary.iter().any(|s| s.enabled) {
+            balance::rank(
+                &self.routing.auxiliary,
+                &self.accounts,
+                &self.usage,
+                self.now,
+                &policy,
+                None,
+            )
+        } else {
+            vec![]
+        };
+        if chain.is_empty() {
+            // No auxiliary account: use the active target.
+            chain = self
+                .target
+                .and_then(|t| self.chain_for_target(t))
+                .map(|(c, _)| c)
+                .unwrap_or_default();
+        }
+        if chain.is_empty() {
+            self.notice = Some("no account available to summarize with".into());
+            return;
+        }
+        let req = ChatRequest {
+            system: None,
+            turns,
+            model: None,
+        };
+        let prev = self.summary.clone();
+        let focus = Some(focus.to_string()).filter(|f| !f.is_empty());
+        let tx = self.tx.clone();
+        self.spawn_task(false, move |core, cancel, _ui, _session| async move {
+            let opts = CompactOpts { force: true, focus };
+            match compact_history(&core, &req, cut, prev, chain, &cancel, &tx, opts).await {
+                Some(s) => {
+                    let _ = tx.send(Msg::Compacted(s));
+                }
+                None => {
+                    let _ = tx.send(Msg::Notice("compaction failed or was cancelled".into()));
+                }
             }
         });
     }
@@ -2638,8 +2758,17 @@ impl App {
     }
 }
 
+#[derive(Default)]
+struct CompactOpts {
+    /// Re-summarize even if the previous summary is recent (`/compact`).
+    force: bool,
+    focus: Option<String>,
+}
+
 /// Folds the old part of `req.turns` into a summary with the auxiliary chain.
-/// Reuses `prev` when fewer than 4 turns have piled up since it was written.
+/// Reuses `prev` when it already covers `cut`, or (unless forced) when fewer than 4
+/// turns have piled up since it was written.
+#[allow(clippy::too_many_arguments)]
 async fn compact_history(
     core: &Core,
     req: &ChatRequest,
@@ -2648,15 +2777,20 @@ async fn compact_history(
     aux: Vec<Account>,
     cancel: &CancellationToken,
     tx: &mpsc::UnboundedSender<Msg>,
+    opts: CompactOpts,
 ) -> Option<compact::Summary> {
+    if cut == 0 || cut >= req.turns.len() {
+        return None;
+    }
+    let slack = if opts.force { 1 } else { 4 };
     if let Some(p) = prev
         .as_ref()
-        .filter(|p| cut.saturating_sub(p.covered) < 4 && p.covered < req.turns.len())
+        .filter(|p| cut.saturating_sub(p.covered) < slack && p.covered < req.turns.len())
     {
         return Some(p.clone());
     }
     let fresh = compact::to_summarize(&req.turns, cut, prev.as_ref());
-    let prompt = compact::summary_prompt(prev.as_ref(), &fresh);
+    let prompt = compact::summary_prompt(prev.as_ref(), &fresh, opts.focus.as_deref());
     let _ = tx.send(Msg::Notice("summarizing older messages...".into()));
     let (quiet_tx, _quiet_rx) = mpsc::unbounded_channel();
     let out = core

@@ -42,13 +42,16 @@ pub fn to_summarize(turns: &[ChatTurn], cut: usize, prev: Option<&Summary>) -> V
     turns[1 + done..=cut].to_vec()
 }
 
-pub fn summary_prompt(prev: Option<&Summary>, fresh: &[ChatTurn]) -> String {
+pub fn summary_prompt(prev: Option<&Summary>, fresh: &[ChatTurn], focus: Option<&str>) -> String {
     let mut p = String::from(
         "Update the running summary of a conversation so a model can continue it without the \
          original messages. Keep: the user's goal, decisions made, constraints, exact values, \
          file names, identifiers and error messages mentioned, and next steps. Be terse. \
          Reply with the summary only.\n\n",
     );
+    if let Some(f) = focus.filter(|f| !f.trim().is_empty()) {
+        p.push_str(&format!("Pay particular attention to: {}\n\n", f.trim()));
+    }
     if let Some(s) = prev.filter(|s| !s.text.is_empty()) {
         p.push_str(&format!("Current summary:\n{}\n\n", s.text));
     }
@@ -131,7 +134,8 @@ mod tests {
         };
         let fresh = to_summarize(&t, 7, Some(&prev));
         assert_eq!(fresh.len(), 3); // turns 5..=7
-        let p = summary_prompt(Some(&prev), &fresh);
+        let p = summary_prompt(Some(&prev), &fresh, Some("the API keys"));
+        assert!(p.contains("particular attention to: the API keys"));
         assert!(p.contains("Current summary:\nold"));
         assert_eq!(to_summarize(&t, 7, None).len(), 7);
     }

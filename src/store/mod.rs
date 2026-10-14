@@ -302,7 +302,7 @@ impl Store {
         let blob = v.seal_json("settings", "blob", &id, value)?;
         sqlx::query(
             "INSERT INTO settings (key, id, blob) VALUES ($1, $2, $3)
-             ON CONFLICT (key) DO UPDATE SET blob = $3, updated_at = now()",
+             ON CONFLICT (key) DO UPDATE SET id = $2, blob = $3, updated_at = now()",
         )
         .bind(key)
         .bind(id)

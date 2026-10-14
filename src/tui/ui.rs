@@ -249,7 +249,7 @@ fn draw_crab(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
-    let in_lines = app.input.split('\n').count().clamp(1, 6) as u16;
+    let in_lines = app.input.as_str().split('\n').count().clamp(1, 6) as u16;
     // The crab needs its own strip; skip it on short terminals.
     let crab_h = if area.height >= 18 {
         crab::HEIGHT as u16
@@ -281,6 +281,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     for e in &app.entries {
         let (name_style, label) = match e.role {
             Role::User => (Style::new().fg(Color::Cyan).bold(), e.who.clone()),
+            Role::System => (Style::new().fg(Color::Yellow).bold(), e.who.clone()),
             _ => (
                 Style::new()
                     .fg(if e.failed { Color::Red } else { Color::Green })
@@ -333,17 +334,26 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     );
 
     let cursor = if app.tick % 6 < 3 { "▏" } else { " " };
+    let (cur_line, cur_col) = app.input.line_col();
     let shown: Vec<Line> = {
-        let mut v: Vec<Line> = app
+        let v: Vec<Line> = app
             .input
+            .as_str()
             .split('\n')
-            .map(|l| Line::raw(l.to_string()))
+            .enumerate()
+            .map(|(i, l)| {
+                if i == cur_line {
+                    let before: String = l.chars().take(cur_col).collect();
+                    let after: String = l.chars().skip(cur_col).collect();
+                    Line::from(vec![Span::raw(before), Span::raw(cursor), Span::raw(after)])
+                } else {
+                    Line::raw(l.to_string())
+                }
+            })
             .collect();
-        if let Some(last) = v.last_mut() {
-            last.spans.push(Span::raw(cursor));
-        }
-        let skip = v.len().saturating_sub(6);
-        v.into_iter().skip(skip).collect()
+        // Keep the line with the cursor in the 6-line window.
+        let skip = (cur_line + 1).saturating_sub(6);
+        v.into_iter().skip(skip).take(6).collect()
     };
     f.render_widget(
         Paragraph::new(shown).wrap(Wrap { trim: false }).block(

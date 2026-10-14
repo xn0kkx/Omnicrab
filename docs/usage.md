@@ -138,6 +138,7 @@ In plan mode a message is not answered directly:
 
 - **Plan with a strong model, execute with cheap ones.** Put e.g. Claude `opus` in Planner and `sonnet`/`haiku` with low effort, flash models or a local model in Executors.
 - **History summaries.** When the conversation grows past *summarize history above* (default ~24 000 tokens, estimated as characters ÷ 4), the Auxiliary account(s) fold older messages into a running summary. The first message and the last *keep last turns* messages stay verbatim. The summary is updated incrementally and kept in memory for the session (it is not stored). This matters most for the CLI accounts, which are single-shot and would otherwise receive the whole history on every message. Without an Auxiliary slot nothing is summarized.
+- **`/compact [focus]`** does the same on demand, like Claude Code: everything between the first message and the last *keep last turns* messages is folded into a summary, which replaces those messages in every later request. The conversation stays on screen and a `compact` entry shows the summary. The optional text tells the summarizer what to keep (`/compact keep the database schema decisions`). It uses the Auxiliary account(s), or the active target when none is configured, and can be repeated: each run updates the previous summary.
 - **No synthesis for one step**, and each step's result is cut at 8 000 characters before synthesis.
 - Executors only see their own task, not the conversation.
 
@@ -153,7 +154,20 @@ Cost is computed from the [price table](providers.md#pricing); CLI accounts use 
 
 ## Chat
 
-- `Enter` sends, `Alt+Enter` (or `Ctrl+J`) inserts a newline, `Esc` clears the box or cancels running requests. `Ctrl+H` works as Backspace for terminals that send `^H`. The mouse wheel and `PageUp`/`PageDown` scroll the chat; hold `Shift` while dragging to select text (mouse capture is on).
+- `Enter` sends, `Alt+Enter` (or `Ctrl+J`) inserts a newline, `Esc` clears the box or cancels running requests. `Ctrl+H` works as Backspace for terminals that send `^H`.
+- The message box edits like a readline prompt (and like Claude Code):
+
+  | Key | Action |
+  | --- | --- |
+  | `←` / `→` | Move the cursor |
+  | `↑` / `↓` | Move between lines of a multi-line message; from the first/last line, browse previously sent messages (your unsent draft comes back at the end) |
+  | `Home` / `End`, `Ctrl+A` / `Ctrl+E` | Start / end of the line |
+  | `Alt+←` / `Alt+→`, `Alt+B` / `Alt+F` | Move by word (`Ctrl+←/→` switch tabs) |
+  | `Backspace`, `Delete` / `Ctrl+D` | Delete before / under the cursor |
+  | `Ctrl+W`, `Alt+Backspace` | Delete the previous word |
+  | `Ctrl+U` / `Ctrl+K` | Delete to the start / end of the line |
+
+  Message history lives in memory only and is gone when omnicrab exits, because prompts are never stored unencrypted. The mouse wheel and `PageUp`/`PageDown` scroll the chat; hold `Shift` while dragging to select text (mouse capture is on).
 - Typing `/` or `@` opens a completion popup; `Tab` completes.
 - A small crab sits above the message box. While a request is running it scuttles from side to side and snaps its claws; when idle it rests (and blinks). It is hidden on very short terminals (< 18 rows).
 - The status bar shows the active target, model override, session tokens/cost and a spinner while requests run.
@@ -175,6 +189,7 @@ Cost is computed from the [price table](providers.md#pricing); CLI accounts use 
 | `/plan` | Toggle plan mode (`Shift+Tab` cycles chat / plan / auto) |
 | `/fanout a,b,c <prompt>` | Send one prompt to several accounts in parallel (names comma separated, no spaces) |
 | `/orchestrate <task>` | Plan → parallel agents → synthesis (see below) |
+| `/compact [focus]` | Summarize older messages now (see below) |
 | `/rename <title>` | Rename the current session |
 | `/passwd` | Change the master password |
 | `/lock` | Lock the vault |
