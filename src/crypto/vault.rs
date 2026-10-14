@@ -32,6 +32,7 @@ impl Default for KdfParams {
 }
 
 /// Persisted (non-secret) vault header.
+#[derive(Clone)]
 pub struct VaultHeader {
     pub kdf_salt: Vec<u8>,
     pub kdf_params: KdfParams,

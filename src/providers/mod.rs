@@ -77,6 +77,13 @@ impl ProviderError {
             "credit",
             "billing",
             "not found in path",
+            "error sending request",
+            "web stream error",
+            "refused",
+            "unreachable",
+            "dns",
+            "network",
+            "cannot start",
         ]
         .iter()
         .any(|k| m.contains(k));
@@ -153,4 +160,16 @@ pub fn which(bin: &str) -> Option<std::path::PathBuf> {
 pub fn secret_str(s: &Option<SecretString>) -> Option<&str> {
     use secrecy::ExposeSecret;
     s.as_ref().map(|k| k.expose_secret())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderError;
+
+    #[test]
+    fn classifies_transport_and_api_errors_as_failover() {
+        assert!(ProviderError::classify("Web stream error for model 'x'.\nCause: error sending request for url (http://localhost:8080/v1)").failover);
+        assert!(ProviderError::classify("HTTP 429 Too Many Requests").failover);
+        assert!(!ProviderError::classify("invalid request: messages must not be empty").failover);
+    }
 }

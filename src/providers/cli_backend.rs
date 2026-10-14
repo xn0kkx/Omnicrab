@@ -60,6 +60,7 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
                 "--verbose",
                 "--include-partial-messages",
                 "--no-session-persistence",
+                "--strict-mcp-config",
                 "--tools",
                 "",
             ]);

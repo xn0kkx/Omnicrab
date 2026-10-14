@@ -2,7 +2,19 @@
 
 ## Status
 
-Early-stage (v0.1), released under the MIT license (see `LICENSE`). Unit tests cover encryption, usage aggregation, CLI output parsing and plan parsing. The PostgreSQL store, the TUI and the CLI/HTTP provider adapters have not yet been verified end-to-end. The Codex and Gemini adapters follow their documented JSONL formats but have never run against the real CLIs.
+Early-stage (v0.1), released under the MIT license (see `LICENSE`).
+
+Verified end-to-end on Linux with PostgreSQL 17 and the real Claude Code CLI and Ollama:
+
+- vault creation, wrong-password rejection, unlock after a wrong attempt, lock/unlock
+- account detection, add/edit (form), connection test, usage per account
+- streaming chat with Claude Code CLI and Ollama, cancellation with `Esc`
+- `@name` routing and `/fanout` with account names containing spaces
+- agents, failover to a fallback account, `/orchestrate` (plan → worker → synthesis)
+- session persistence and resume after restart
+- database inspection: no account name, key, prompt, answer, model or token count appears in plaintext
+
+Not yet verified: the Codex and Gemini CLI adapters (they follow the documented JSONL formats but were never run against the real CLIs), API-key providers against their real endpoints, and non-Linux platforms.
 
 ## Requirements
 

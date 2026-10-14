@@ -525,7 +525,7 @@ impl App {
                 let (pw, first, header, store, tx) = (
                     u.pw.clone(),
                     u.first_run,
-                    u.header.take(),
+                    u.header.clone(),
                     self.store.clone(),
                     self.tx.clone(),
                 );
@@ -1361,6 +1361,38 @@ impl App {
 
     // ------------------------------------------------------------------ chat submit & commands
 
+    /// Longest agent/account name at the start of `s` (case-insensitive) that ends at
+    /// whitespace, a comma or the end of the text. Agents win ties.
+    fn take_name<'a>(&self, s: &'a str, accounts_only: bool) -> Option<(Target, &'a str)> {
+        let agents = self
+            .agents
+            .iter()
+            .map(|a| (a.name.as_str(), Target::Agent(a.id)));
+        let accounts = self
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), Target::Account(a.id)));
+        let mut best: Option<(usize, Target)> = None;
+        let cands: Vec<(&str, Target)> = if accounts_only {
+            accounts.collect()
+        } else {
+            agents.chain(accounts).collect()
+        };
+        for (name, t) in cands {
+            let n = name.len();
+            let fits = s.is_char_boundary(n)
+                && s.get(..n).is_some_and(|p| p.eq_ignore_ascii_case(name))
+                && s[n..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || c == ',');
+            if fits && best.is_none_or(|(b, _)| n > b) {
+                best = Some((n, t));
+            }
+        }
+        best.map(|(n, t)| (t, &s[n..]))
+    }
+
     fn find_account(&self, name: &str) -> Option<&Account> {
         let n = name.trim().trim_start_matches('@');
         self.accounts
@@ -1393,23 +1425,17 @@ impl App {
         }
         // @name routing
         let (target, prompt) = match text.strip_prefix('@') {
-            Some(rest) => {
-                let (name, body) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-                let t = modes::resolve_agent(&self.agents, name)
-                    .map(|a| Target::Agent(a.id))
-                    .or_else(|| self.find_account(name).map(|a| Target::Account(a.id)));
-                match t {
-                    Some(t) if !body.trim().is_empty() => (Some(t), body.trim().to_string()),
-                    Some(_) => {
-                        self.notice = Some("write a message after @name".into());
-                        return;
-                    }
-                    None => {
-                        self.notice = Some(format!("no agent/account named '{name}'"));
-                        return;
-                    }
+            Some(rest) => match self.take_name(rest, false) {
+                Some((t, tail)) if !tail.trim().is_empty() => (Some(t), tail.trim().to_string()),
+                Some(_) => {
+                    self.notice = Some("write a message after @name".into());
+                    return;
                 }
-            }
+                None => {
+                    self.notice = Some("no agent/account with that name".into());
+                    return;
+                }
+            },
             None => (self.target, text),
         };
         let Some(target) = target else {
@@ -1619,25 +1645,25 @@ impl App {
     }
 
     fn cmd_fanout(&mut self, rest: &str) {
-        let Some((names, prompt)) = rest.split_once(char::is_whitespace) else {
-            self.notice = Some("usage: /fanout a,b,c <prompt>".into());
-            return;
-        };
-        let mut accts = vec![];
-        for n in names.split(',').filter(|s| !s.trim().is_empty()) {
-            match self.find_account(n) {
-                Some(a) => accts.push(a.clone()),
-                None => {
-                    self.notice = Some(format!("unknown account '{n}'"));
-                    return;
-                }
+        let mut accts: Vec<Account> = vec![];
+        let mut tail = rest;
+        // Names may contain spaces, so match known account names instead of splitting.
+        while let Some((Target::Account(id), after)) = self.take_name(tail, true) {
+            if let Some(a) = self.accounts.iter().find(|a| a.id == id) {
+                accts.push(a.clone());
+            }
+            tail = after;
+            match tail.strip_prefix(',') {
+                Some(t) => tail = t.trim_start(),
+                None => break,
             }
         }
-        if accts.len() < 2 {
+        if accts.len() < 2 || tail.trim().is_empty() {
             self.notice =
-                Some("fanout needs at least two accounts (comma separated, no spaces)".into());
+                Some("usage: /fanout <account>,<account>[,...] <prompt>  (2+ accounts)".into());
             return;
         }
+        let prompt = tail;
         let prompt = prompt.trim().to_string();
         self.push_user(&format!(
             "/fanout {} - {}",

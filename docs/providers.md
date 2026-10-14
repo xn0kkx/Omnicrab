@@ -29,7 +29,7 @@ Anthropic's terms do not allow using Free/Pro/Max OAuth tokens in third-party ap
 
 | Kind | Command (simplified) |
 | --- | --- |
-| Claude Code | `claude -p <prompt> --output-format stream-json --verbose --include-partial-messages --no-session-persistence --tools ""` |
+| Claude Code | `claude -p <prompt> --output-format stream-json --verbose --include-partial-messages --no-session-persistence --strict-mcp-config --tools ""` |
 | Codex | `codex exec --json --skip-git-repo-check --sandbox read-only <prompt>` |
 | Gemini CLI | `gemini --output-format stream-json -p <prompt>` |
 
@@ -38,6 +38,7 @@ Details:
 - Log in once with the CLI itself (`claude`, `codex login`, `gemini`).
 - The subprocess runs in the system temp directory with tools disabled or read-only, so it cannot touch your projects.
 - Multi-turn history is flattened into one prompt because these CLIs are single-shot.
+- `--strict-mcp-config` stops the CLI from loading the MCP servers of your global config, which otherwise adds ~20k input tokens (about 5× the cost) to every request.
 - Token counts and (for Claude) `total_cost_usd` come from the CLI's final JSON event.
 - A custom binary path can be set per account.
 - Output formats change between CLI versions. Parsers ignore unknown events; if a CLI starts failing, check the log and `omnicrab doctor`.
