@@ -1,0 +1,58 @@
+# Providers
+
+## API-key providers
+
+Handled by the [`genai`](https://crates.io/crates/genai) crate. A fresh client is built per request with a service-target resolver that injects the account's adapter, endpoint and API key, so any number of accounts of the same provider coexist.
+
+| Provider | Notes |
+| --- | --- |
+| Anthropic | Native protocol |
+| OpenAI | Chat Completions |
+| Google Gemini | Native protocol |
+| OpenRouter, Groq, DeepSeek, xAI | Native adapters |
+| Mistral | OpenAI-compatible endpoint (`https://api.mistral.ai/v1`) |
+
+Default model names are suggestions and can be edited in the account form.
+
+## Local models
+
+| Kind | Default URL | Notes |
+| --- | --- | --- |
+| Ollama | `http://localhost:11434` | `D` in the Accounts tab detects it and uses the first installed model. |
+| OpenAI-compatible | `http://localhost:8080/v1` | llama.cpp server, LM Studio, vLLM, LocalAI… Set the model name your server expects. |
+
+Local accounts have no API key and cost `$0`.
+
+## Subscription accounts via official CLIs
+
+Anthropic's terms do not allow using Free/Pro/Max OAuth tokens in third-party applications, and other vendors have similar restrictions. omnicrab therefore **never reads or reuses subscription credentials**. Instead it runs the vendor's own CLI as a subprocess, which authenticates itself:
+
+| Kind | Command (simplified) |
+| --- | --- |
+| Claude Code | `claude -p <prompt> --output-format stream-json --verbose --include-partial-messages --no-session-persistence --tools ""` |
+| Codex | `codex exec --json --skip-git-repo-check --sandbox read-only <prompt>` |
+| Gemini CLI | `gemini --output-format stream-json -p <prompt>` |
+
+Details:
+
+- Log in once with the CLI itself (`claude`, `codex login`, `gemini`).
+- The subprocess runs in the system temp directory with tools disabled or read-only, so it cannot touch your projects.
+- Multi-turn history is flattened into one prompt because these CLIs are single-shot.
+- Token counts and (for Claude) `total_cost_usd` come from the CLI's final JSON event.
+- A custom binary path can be set per account.
+- Output formats change between CLI versions. Parsers ignore unknown events; if a CLI starts failing, check the log and `omnicrab doctor`.
+
+Check the current terms of each vendor before relying on this for automation.
+
+## Pricing
+
+Cost for API accounts = `tokens_in × input + tokens_out × output` per 1M tokens, looked up by the **longest model-name prefix** in:
+
+1. entries from `[prices]` in `config.toml` (win ties), then
+2. a built-in table of approximate list prices (Claude, GPT, Gemini, DeepSeek, Grok, Mistral, Llama).
+
+Unknown models cost 0 and are still counted in requests and tokens. Prices change; override them in the config.
+
+## Adding a provider
+
+Implement a new `ProviderKind` in `src/model.rs` and map it in `src/providers/genai_backend.rs` (`adapter_for`, `endpoint_for`), or add a new backend module that sends `ProviderEvent`s on the channel given to `stream_chat`.
