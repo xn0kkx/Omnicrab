@@ -11,6 +11,9 @@ omnicrab is a terminal UI that connects many AI accounts and local models and le
 - Define named agents and route messages with `@agent`.
 - Send one prompt to several accounts with `/fanout`, or let agents split a task with `/orchestrate`.
 - Fall back to another account automatically on rate limits, auth errors or exhausted budgets.
+- Pick models from lists each account actually offers, and assign roles in the **Routing** tab: which account plans, which execute, which merge and which summarize.
+- Balance work by free capacity (plan limits, budgets, local models) and turn on **plan mode** to review a plan before it runs.
+- Save tokens: strong planner and cheap executors, summaries of old history, no synthesis for single-step plans.
 
 ## Install
 
@@ -52,8 +55,11 @@ On first launch you choose a master password. It is never stored and cannot be r
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+P` | Quick tab switcher (`c` `a` `g` `u` `s` or `1`–`5`) |
-| `Ctrl+←` / `Ctrl+→`, click, `F1`–`F5` | Previous/next tab, click a tab, jump to a tab |
+| `Ctrl+P` | Quick tab switcher (`c` `a` `g` `u` `s` `r` or `1`–`6`) |
+| `Ctrl+←` / `Ctrl+→`, click, `F1`–`F6` | Previous/next tab, click a tab, jump to a tab |
+| `Shift+Tab` | Cycle mode: chat → plan (review before running) → auto |
+| `Ctrl+O` / `/plan` | Toggle plan mode |
+| `/model` | Open the model picker |
 | `Enter` / `Alt+Enter` | Send / new line |
 | `Esc` | Cancel running requests |
 | `Ctrl+N` / `Ctrl+L` | New session / lock |

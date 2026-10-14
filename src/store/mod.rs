@@ -260,6 +260,58 @@ impl Store {
             .collect()
     }
 
+    // ---------- settings ----------
+
+    /// Stable row id per setting key, so the AAD stays unique without a second column.
+    fn setting_id(key: &str) -> Uuid {
+        use sha2::{Digest, Sha256};
+        let h = Sha256::digest(key.as_bytes());
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&h[..16]);
+        Uuid::from_bytes(b)
+    }
+
+    pub async fn load_setting<T: serde::de::DeserializeOwned>(
+        &self,
+        v: &Vault,
+        key: &str,
+    ) -> Result<Option<T>> {
+        let id = Self::setting_id(key);
+        let row = sqlx::query("SELECT blob FROM settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| {
+            Ok(v.open_json(
+                "settings",
+                "blob",
+                &id,
+                r.get::<Vec<u8>, _>("blob").as_slice(),
+            )?)
+        })
+        .transpose()
+    }
+
+    pub async fn save_setting<T: serde::Serialize>(
+        &self,
+        v: &Vault,
+        key: &str,
+        value: &T,
+    ) -> Result<()> {
+        let id = Self::setting_id(key);
+        let blob = v.seal_json("settings", "blob", &id, value)?;
+        sqlx::query(
+            "INSERT INTO settings (key, id, blob) VALUES ($1, $2, $3)
+             ON CONFLICT (key) DO UPDATE SET blob = $3, updated_at = now()",
+        )
+        .bind(key)
+        .bind(id)
+        .bind(blob)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // ---------- usage ----------
 
     pub async fn record_usage(&self, v: &Vault, account: Uuid, e: &UsageEvent) -> Result<()> {

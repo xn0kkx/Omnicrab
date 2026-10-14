@@ -16,6 +16,8 @@ pub enum FieldId {
     Fallbacks,
     NewPw,
     ConfirmPw,
+    StepText,
+    Feedback,
 }
 
 #[derive(Clone, Debug)]
@@ -65,9 +67,17 @@ impl Field {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormKind {
-    Account { edit: Option<uuid::Uuid> },
-    Agent { edit: Option<uuid::Uuid> },
+    Account {
+        edit: Option<uuid::Uuid>,
+    },
+    Agent {
+        edit: Option<uuid::Uuid>,
+    },
     Passwd,
+    /// Edit the task text of step `n` in the plan under review.
+    PlanStep(usize),
+    /// Ask the planner to revise the plan under review.
+    PlanFeedback,
 }
 
 #[derive(Clone, Debug)]

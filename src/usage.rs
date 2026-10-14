@@ -230,6 +230,7 @@ mod tests {
             profile_dir: None,
             budget_usd_month: None,
             enabled: true,
+            effort: None,
         }
     }
 

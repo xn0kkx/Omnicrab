@@ -1,5 +1,6 @@
 //! Provider backends. All of them stream [`ProviderEvent`]s over an mpsc channel.
 
+pub mod catalog;
 pub mod cli_backend;
 pub mod genai_backend;
 pub mod ollama_discovery;

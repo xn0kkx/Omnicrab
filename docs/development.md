@@ -14,6 +14,8 @@ Verified end-to-end on Linux with PostgreSQL 17 and the real Claude Code CLI, An
 - session persistence and resume after restart
 - database inspection: no account name, key, prompt, answer, model or token count appears in plaintext
 
+Plan mode, routing and balancing (unit-tested for ranking, plan parsing, history cut points and model-list parsing) were also exercised against the real Claude Code and `agy` CLIs on a scratch database: role slots persist across restarts and are encrypted in `settings`, the model picker lists `agy models` and the Claude aliases, a plan with two steps was reviewed, edited by removing a step and executed on the pool, and a single-step plan skipped synthesis.
+
 Not yet verified: the Codex and Gemini CLI adapters (they follow the documented JSONL formats but were never run against the real CLIs), API-key providers against their real endpoints, and non-Linux platforms.
 
 ## Requirements
@@ -64,6 +66,8 @@ psql "$OMNICRAB_DATABASE_URL" -Atc "select encode(blob,'escape') from messages" 
 | Slash command | `COMMANDS` and `App::command` in `tui/app.rs` |
 | Table column | New migration file in `migrations/`, never edit `0001_init.sql` after release |
 | Orchestration mode | `orchestrator/modes.rs`; label lanes with `RunEvent::Label` |
+| Setting stored in the database | `Store::save_setting` / `load_setting` with a new key (no migration needed) |
+| Balancing rule | `orchestrator/balance.rs` (`headroom`, `rank_with_load`) with a unit test |
 
 ## Continuous integration
 
@@ -76,3 +80,5 @@ psql "$OMNICRAB_DATABASE_URL" -Atc "select encode(blob,'escape') from messages" 
 - Cursor movement and history in the message box
 - Daemon mode with a JSON-RPC socket
 - Optional OS keyring caching of the unlocked key
+- Persist the history summary with the session
+- Per-slot daily token caps in the balancer

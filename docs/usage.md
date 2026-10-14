@@ -17,17 +17,18 @@
 | **Agents** | Define named agents with role, system prompt, account and fallbacks. |
 | **Usage** | Per-account consumption and costs. |
 | **Sessions** | Resume or delete saved conversations. |
+| **Routing** | Which accounts plan, execute, merge and summarize, and how load is balanced. |
 
 Switching tabs (works from anywhere, including the chat box; `Alt` is deliberately not used because terminals use it for their own tabs):
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+P` | Quick switcher: press `c` Chat, `a` Accounts, `g` Agents, `u` Usage, `s` Sessions (or `1`–`5`, or `↑/↓` + `Enter`). `Esc` closes it. |
+| `Ctrl+P` | Quick switcher: press `c` Chat, `a` Accounts, `g` Agents, `u` Usage, `s` Sessions, `r` Routing (or `1`–`6`, or `↑/↓` + `Enter`). `Esc` closes it. |
 | `Ctrl+←` / `Ctrl+→` | Previous / next tab |
 | Mouse click | Click a tab title in the top bar |
-| `F1`–`F5` | Jump to a tab |
-| `Tab` / `Shift+Tab` | Next / previous tab in list tabs (in Chat, `Tab` completes `/` and `@` first) |
-| `1`–`5` | Jump to a tab from list tabs |
+| `F1`–`F6` | Jump to a tab |
+| `Tab` / `Shift+Tab` | Next / previous tab in list tabs. In Chat, `Tab` completes `/` and `@` first, and `Shift+Tab` cycles the mode |
+| `1`–`6` | Jump to a tab from list tabs |
 
 Lists share navigation keys: `↑/↓` or `j/k` to move, `Esc` to return to Chat, `?` for help.
 
@@ -43,6 +44,7 @@ Lists share navigation keys: `↑/↓` or `j/k` to move, `Esc` to return to Chat
 | `d` | Delete (with confirmation) |
 | `L` | Sign in the selected CLI account (runs the CLI's own login for its **Profile dir**) |
 | `D` | Detect installed CLIs (`claude`, `agy`, `codex`, `gemini`) and add them |
+| `m` | Refresh the list of models this account offers (see [model picker](#choosing-models)) |
 
 The add/edit form only shows the fields relevant to the chosen provider. `Ctrl+T` tests the connection from inside the form. When editing, leave **API key** empty to keep the stored one; the current key is shown masked (`sk-…abcd`).
 
@@ -56,6 +58,88 @@ An agent has:
 - **Role** and **System prompt** – combined into the system message.
 - **Account** and optional **Model** override.
 - **Fallbacks** – account names, comma separated, tried in order on failover.
+
+### Choosing models
+
+omnicrab asks every enabled account which models it offers when you unlock the vault (and again with `m` in the Accounts tab):
+
+| Account | Source |
+| --- | --- |
+| Ollama / OpenAI-compatible | the server's own model list |
+| API providers | the provider's model-list endpoint |
+| Antigravity (`agy`) | `agy models` |
+| Claude Code, Codex, Gemini CLI | a built-in list (the CLIs cannot list models); you can always type any name |
+
+The lists feed one filterable **picker**: type to filter, `↑/↓`, `Enter` to choose, `Esc` to cancel. If nothing matches, `Enter` uses what you typed.
+
+- `/model` opens the picker (`account › model`) for the chat; `/model <name>` sets it directly; `/model reset` clears it.
+- In the account and agent forms, `Ctrl+O` on the **Model** field opens the picker.
+- In the Routing tab, `m` opens it for the selected slot.
+
+### Routing tab
+
+Roles are stored encrypted in the database like everything else.
+
+| Section | Purpose |
+| --- | --- |
+| **Planner** | Splits the task into steps. Use a strong model. Without slots here, the active target plans. |
+| **Executors** | Pool for steps that do not name an agent. |
+| **Synthesizer** | Merges the results of 2+ steps. Empty means the planner does it. |
+| **Auxiliary** | Cheap housekeeping: summaries of old messages. A local model is ideal. |
+| **Policy** | Balancing and history limits (below). |
+
+Each slot is an account plus an optional **model** and, for Claude Code accounts, an **effort** (`--effort low|medium|high|xhigh|max`). The bar shows how much of the account is still free.
+
+| Key | Action |
+| --- | --- |
+| `a` | Add an account to the selected section |
+| `m` | Choose the slot's model |
+| `f` | Cycle effort (Claude Code accounts) |
+| `Space` | Enable/disable the slot (on a policy row: adjust it) |
+| `J` / `K` | Move the slot down / up |
+| `d` | Remove the slot |
+| `+` / `-` | Change the selected policy value |
+
+**Balancing.** Slots of a role are ordered by free capacity before every run:
+
+- local models count as fully free (and go first with *prefer local models*);
+- Claude Code accounts use `1 − max(5-hour use, weekly use)` from the plan limits shown in the Usage tab;
+- API accounts with a monthly budget use the budget left;
+- others have unknown capacity and rank in the middle, fewest requests today first;
+- accounts above *skip accounts above* (default 85 %) go to the end of the chain but stay available as failover; accounts over their monthly budget are dropped;
+- parallel steps are spread so they do not all start on the same account;
+- the planner stays on the same account while it has room, which keeps the provider's prompt cache warm.
+
+Failover works as before on the ordered chain.
+
+### Modes
+
+`Shift+Tab` in the Chat tab cycles the mode, as in Claude Code: **chat → plan → auto**. The status bar shows `PLAN` or `AUTO` (nothing in chat mode). `/plan` or `Ctrl+O` toggles plan mode directly.
+
+| Mode | A plain message… |
+| --- | --- |
+| chat | goes straight to the active target |
+| plan | is planned, shown for your review, then executed |
+| auto | is planned and executed right away, without review (same as `/orchestrate`) |
+
+`@name message` always bypasses the mode.
+
+### Plan mode
+
+In plan mode a message is not answered directly:
+
+1. The **planner** returns 1–4 self-contained steps. A step may name an agent, or leave it empty for the executor pool.
+2. A **review** window opens: `Enter` approves, `e` edits a step's text, `d` removes a step, `r` asks the planner to revise with your feedback, `Esc` discards.
+3. Approved steps run in parallel on the balanced executors. With 2+ steps the **synthesizer** merges them; with one step its answer is final.
+
+`@name message` still goes straight to that agent or account. `/orchestrate <task>` does the same pipeline without the review.
+
+### Saving tokens
+
+- **Plan with a strong model, execute with cheap ones.** Put e.g. Claude `opus` in Planner and `sonnet`/`haiku` with low effort, flash models or a local model in Executors.
+- **History summaries.** When the conversation grows past *summarize history above* (default ~24 000 tokens, estimated as characters ÷ 4), the Auxiliary account(s) fold older messages into a running summary. The first message and the last *keep last turns* messages stay verbatim. The summary is updated incrementally and kept in memory for the session (it is not stored). This matters most for the CLI accounts, which are single-shot and would otherwise receive the whole history on every message. Without an Auxiliary slot nothing is summarized.
+- **No synthesis for one step**, and each step's result is cut at 8 000 characters before synthesis.
+- Executors only see their own task, not the conversation.
 
 ### Usage tab
 
@@ -87,7 +171,8 @@ Cost is computed from the [price table](providers.md#pricing); CLI accounts use 
 | `/new` | Start a new session |
 | `/sessions`, `/usage`, `/accounts`, `/agents` | Jump to a tab |
 | `/use <name>` | Choose the active agent or account |
-| `/model <name>` | Override the model for subsequent requests; empty resets |
+| `/model [name\|reset]` | Open the model picker, set the override, or clear it |
+| `/plan` | Toggle plan mode (`Shift+Tab` cycles chat / plan / auto) |
 | `/fanout a,b,c <prompt>` | Send one prompt to several accounts in parallel (names comma separated, no spaces) |
 | `/orchestrate <task>` | Plan → parallel agents → synthesis (see below) |
 | `/rename <title>` | Rename the current session |
@@ -98,11 +183,11 @@ Cost is computed from the [price table](providers.md#pricing); CLI accounts use 
 
 ### Orchestration
 
-`/orchestrate <task>` uses the active target as **planner and synthesizer**:
+`/orchestrate <task>` uses the **Planner** of the Routing tab (or the active target when none is set):
 
 1. The planner receives the agent roster and returns a JSON list `[{"agent": "...", "task": "..."}]`.
-2. Each step runs in parallel on the named agent's account chain (unknown names run on the planner's account).
-3. The planner receives all results and writes the final answer.
+2. Each step runs in parallel on the named agent's account chain; steps without an agent run on the balanced executor pool (or on the planner's account when the pool is empty).
+3. With 2+ steps the synthesizer writes the final answer; with one step that answer is final.
 
 Each stage appears as its own message labelled `[planner]`, `[@agent]` or `[synthesis]`. If the plan cannot be parsed, the task runs as a single step. Create agents first (Agents tab) to get meaningful delegation.
 

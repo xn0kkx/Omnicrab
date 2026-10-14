@@ -12,6 +12,10 @@ use tokio_util::sync::CancellationToken;
 use super::{ChatRequest, ProviderError, ProviderEvent, TokenUsage, secret_str};
 use crate::model::{Account, ProviderKind, Role};
 
+pub fn adapter_of(kind: ProviderKind) -> AdapterKind {
+    adapter_for(kind)
+}
+
 fn adapter_for(kind: ProviderKind) -> AdapterKind {
     match kind {
         ProviderKind::Anthropic => AdapterKind::Anthropic,
@@ -164,6 +168,7 @@ mod tests {
             profile_dir: None,
             budget_usd_month: None,
             enabled: true,
+            effort: None,
         }
     }
 

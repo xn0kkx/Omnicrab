@@ -1,6 +1,6 @@
 //! Application state and event handling. Rendering lives in `ui.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::form::{Field, FieldId, Form, FormKind};
 use crate::crypto::{KdfParams, Vault, VaultHeader};
 use crate::model::*;
-use crate::orchestrator::{Core, LaneId, RunEvent, modes};
+use crate::orchestrator::{Core, LaneId, RunEvent, balance, compact, modes};
 use crate::providers::{self, ChatRequest, ChatTurn};
 use crate::store::Store;
 use crate::usage::{AccountUsage, PriceTable, Window, aggregate};
@@ -30,15 +30,17 @@ pub enum Tab {
     Agents,
     Usage,
     Sessions,
+    Routing,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Chat,
         Tab::Accounts,
         Tab::Agents,
         Tab::Usage,
         Tab::Sessions,
+        Tab::Routing,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -47,6 +49,7 @@ impl Tab {
             Tab::Agents => "Agents",
             Tab::Usage => "Usage",
             Tab::Sessions => "Sessions",
+            Tab::Routing => "Routing",
         }
     }
     pub fn index(self) -> usize {
@@ -64,6 +67,7 @@ impl Tab {
             Tab::Agents => 'g',
             Tab::Usage => 'u',
             Tab::Sessions => 's',
+            Tab::Routing => 'r',
         }
     }
     /// Which tab sits under screen column `col` of the tab bar. Mirrors how
@@ -106,13 +110,84 @@ pub enum Modal {
     Help,
     /// Quick tab switcher (`Ctrl+P`); holds the highlighted tab index.
     Switcher(usize),
+    /// Filterable list (models, accounts).
+    Picker(Picker),
+    /// Review of `App::pending_plan`.
+    Plan,
 }
+
+/// What happens with the value chosen in a [`Picker`].
+pub enum PickPurpose {
+    /// Add an account to routing section `.0`.
+    AddSlot(usize),
+    /// Set the model of slot `.1` in section `.0`.
+    SlotModel(usize, usize),
+    /// Override the model of the chat (`/model`).
+    ChatModel,
+    /// Fill the Model field of the form that opened the picker.
+    FormModel(Box<Form>),
+}
+
+pub struct Picker {
+    pub title: String,
+    /// `(label, value)`
+    pub items: Vec<(String, String)>,
+    pub filter: String,
+    pub sel: usize,
+    pub purpose: PickPurpose,
+}
+
+impl Picker {
+    pub fn visible(&self) -> Vec<&(String, String)> {
+        let f = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .filter(|(l, _)| f.is_empty() || l.to_lowercase().contains(&f))
+            .collect()
+    }
+
+    /// Models accept typed text when the list has no match.
+    fn free_text(&self) -> bool {
+        !matches!(self.purpose, PickPurpose::AddSlot(_))
+    }
+}
+
+/// A plan waiting for approval.
+pub struct PlanReview {
+    /// The user's original task.
+    pub task: String,
+    pub steps: Vec<modes::Step>,
+    pub sel: usize,
+    /// First lane of the block reserved for this run.
+    pub base: LaneId,
+}
+
+/// One selectable line of the Routing tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingRow {
+    Header(usize),
+    Slot(usize, usize),
+    Policy(usize),
+}
+
+pub const POLICY_ROWS: usize = 4;
 
 #[allow(clippy::enum_variant_names)]
 pub enum ConfirmAction {
     DeleteAccount(Uuid),
     DeleteAgent(Uuid),
     DeleteSession(Uuid),
+}
+
+/// What a plain chat message does (cycled with `Shift+Tab`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Straight to the active target.
+    Normal,
+    /// Planner proposes steps, you review, then they run.
+    Plan,
+    /// Planner proposes steps and they run immediately.
+    Auto,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -154,6 +229,13 @@ pub enum Msg {
     FormStatus(String),
     SessionLoaded(Uuid, Vec<Message>),
     HeaderReady(Option<VaultHeader>),
+    Models(Uuid, Result<Vec<String>, String>),
+    PlanReady {
+        task: String,
+        steps: Vec<modes::Step>,
+        base: LaneId,
+    },
+    Summary(compact::Summary),
 }
 
 pub struct Loaded {
@@ -161,6 +243,7 @@ pub struct Loaded {
     pub agents: Vec<Agent>,
     pub sessions: Vec<SessionMeta>,
     pub usage: HashMap<Uuid, AccountUsage>,
+    pub routing: Option<Routing>,
 }
 
 pub struct App {
@@ -177,11 +260,22 @@ pub struct App {
     pub entries: Vec<Entry>,
     pub input: String,
     pub scroll_up: u16,
-    pub sel: [usize; 5],
+    pub sel: [usize; 6],
     pub modal: Option<Modal>,
     pub notice: Option<String>,
     pub target: Option<Target>,
     pub model_override: Option<String>,
+    pub routing: Routing,
+    /// The routing config is read from the database once; later edits are local.
+    routing_ready: bool,
+    pub models: HashMap<Uuid, Vec<String>>,
+    pub models_err: HashMap<Uuid, String>,
+    models_asked: HashSet<Uuid>,
+    pub mode: Mode,
+    pub pending_plan: Option<PlanReview>,
+    summary: Option<compact::Summary>,
+    /// Account that planned last; kept first while it has room (prompt cache).
+    planner_last: Option<Uuid>,
     pub session_id: Option<Uuid>,
     pub session_cost: f64,
     pub session_tokens: u64,
@@ -209,7 +303,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/use", "/use <account|agent> - choose who answers"),
     (
         "/model",
-        "/model <name> - override the model (empty = reset)",
+        "/model [name|reset] - pick or set the model override",
     ),
     (
         "/fanout",
@@ -218,6 +312,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     (
         "/orchestrate",
         "/orchestrate <task> - plan, run agents in parallel, synthesize",
+    ),
+    (
+        "/plan",
+        "toggle plan mode (Shift+Tab cycles chat/plan/auto)",
     ),
     ("/rename", "/rename <title> - rename this session"),
     ("/passwd", "change the master password"),
@@ -271,11 +369,20 @@ impl App {
             entries: vec![],
             input: String::new(),
             scroll_up: 0,
-            sel: [0; 5],
+            sel: [0; 6],
             modal: None,
             notice: None,
             target: None,
             model_override: None,
+            routing: Routing::default(),
+            routing_ready: false,
+            models: HashMap::new(),
+            models_err: HashMap::new(),
+            models_asked: HashSet::new(),
+            mode: Mode::Normal,
+            pending_plan: None,
+            summary: None,
+            planner_last: None,
             session_id: None,
             session_cost: 0.0,
             session_tokens: 0,
@@ -391,6 +498,22 @@ impl App {
                 self.agents = l.agents;
                 self.sessions = l.sessions;
                 self.usage = l.usage;
+                if !self.routing_ready {
+                    self.routing_ready = true;
+                    if let Some(r) = l.routing {
+                        self.routing = r;
+                    }
+                }
+                self.routing.prune(&self.accounts);
+                let missing: Vec<Account> = self
+                    .accounts
+                    .iter()
+                    .filter(|a| a.enabled && !self.models_asked.contains(&a.id))
+                    .cloned()
+                    .collect();
+                for a in missing {
+                    self.fetch_models(a);
+                }
                 if self.target.is_none() {
                     self.target = self
                         .accounts
@@ -398,10 +521,12 @@ impl App {
                         .find(|a| a.enabled)
                         .map(|a| Target::Account(a.id));
                 }
+                let rows = self.routing_rows().len();
                 for (i, n) in [
                     (1, self.accounts.len()),
                     (2, self.agents.len()),
                     (4, self.sessions.len()),
+                    (5, rows),
                 ] {
                     self.sel[i] = self.sel[i].min(n.saturating_sub(1));
                 }
@@ -414,6 +539,27 @@ impl App {
                 }
             }
             Msg::Notice(s) => self.notice = Some(s),
+            Msg::Models(id, r) => match r {
+                Ok(list) => {
+                    self.models_err.remove(&id);
+                    self.models.insert(id, list);
+                }
+                Err(e) => {
+                    self.models_err
+                        .insert(id, e.lines().next().unwrap_or("").to_string());
+                }
+            },
+            Msg::PlanReady { task, steps, base } => {
+                self.pending_plan = Some(PlanReview {
+                    task,
+                    steps,
+                    sel: 0,
+                    base,
+                });
+                self.modal = Some(Modal::Plan);
+                self.notice = Some("review the plan: Enter approves, Esc discards".into());
+            }
+            Msg::Summary(s) => self.summary = Some(s),
             Msg::FormStatus(s) => {
                 if let Some(Modal::Form(f)) = &mut self.modal {
                     f.status = Some(s);
@@ -436,6 +582,7 @@ impl App {
                     .collect();
                 self.session_cost = 0.0;
                 self.session_tokens = 0;
+                self.summary = None;
                 self.scroll_up = 0;
                 self.tab = Tab::Chat;
             }
@@ -511,11 +658,13 @@ impl App {
                 let agents = core.store.list_agents(&core.vault).await?;
                 let sessions = core.store.list_sessions(&core.vault).await?;
                 let events = core.store.load_usage(&core.vault, None).await?;
+                let routing = core.store.load_setting(&core.vault, "routing").await?;
                 Ok(Loaded {
                     accounts,
                     agents,
                     sessions,
                     usage: aggregate(&events, Utc::now()),
+                    routing,
                 })
             }
             .await;
@@ -552,7 +701,11 @@ impl App {
             Screen::Unlock(_) => self.on_key_unlock(k),
             Screen::Main => {
                 if self.modal.is_some() {
-                    self.on_key_modal(k)
+                    self.on_key_modal(k);
+                    // Closing a form opened from the plan review returns to the review.
+                    if self.modal.is_none() && self.pending_plan.is_some() {
+                        self.modal = Some(Modal::Plan);
+                    }
                 } else {
                     self.on_key_main(k)
                 }
@@ -652,7 +805,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         // Global tab switching.
         match k.code {
-            KeyCode::F(n @ 1..=5) => {
+            KeyCode::F(n @ 1..=6) => {
                 self.tab = Tab::ALL[(n - 1) as usize];
                 self.on_tab_enter();
                 return;
@@ -687,7 +840,7 @@ impl App {
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
-            KeyCode::Char(c @ '1'..='5') => {
+            KeyCode::Char(c @ '1'..='6') => {
                 self.tab = Tab::ALL[c as usize - '1' as usize];
                 self.on_tab_enter();
             }
@@ -713,6 +866,7 @@ impl App {
                     }
                 }
                 Tab::Sessions => self.on_key_sessions(k),
+                Tab::Routing => self.on_key_routing(k),
                 Tab::Chat => {}
             },
         }
@@ -766,7 +920,10 @@ impl App {
     }
 
     fn on_tab_enter(&mut self) {
-        if matches!(self.tab, Tab::Usage | Tab::Sessions | Tab::Accounts) {
+        if matches!(
+            self.tab,
+            Tab::Usage | Tab::Sessions | Tab::Accounts | Tab::Routing
+        ) {
             self.reload();
         }
     }
@@ -777,6 +934,7 @@ impl App {
             Tab::Agents => self.agents.len(),
             Tab::Sessions => self.sessions.len(),
             Tab::Usage => self.accounts.len(),
+            Tab::Routing => self.routing_rows().len(),
             Tab::Chat => 0,
         }
     }
@@ -808,6 +966,8 @@ impl App {
             }
             KeyCode::Char('j') if ctrl => self.input.push('\n'),
             KeyCode::Char('u') if ctrl => self.input.clear(),
+            KeyCode::Char('o') if ctrl => self.toggle_plan_mode(),
+            KeyCode::BackTab => self.cycle_mode(),
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.input);
                 if !text.trim().is_empty() {
@@ -828,10 +988,6 @@ impl App {
                     self.tab = Tab::Accounts;
                     self.on_tab_enter();
                 }
-            }
-            KeyCode::BackTab => {
-                self.tab = Tab::Sessions;
-                self.on_tab_enter();
             }
             KeyCode::Char('?') if self.input.is_empty() => self.modal = Some(Modal::Help),
             KeyCode::Char(c) if !ctrl => self.input.push(c),
@@ -875,6 +1031,12 @@ impl App {
     fn on_key_accounts(&mut self, k: KeyEvent) {
         let sel = self.accounts.get(self.sel[1]).cloned();
         match k.code {
+            KeyCode::Char('m') => {
+                if let Some(a) = sel {
+                    self.notice = Some(format!("refreshing models of '{}'...", a.name));
+                    self.fetch_models(a);
+                }
+            }
             KeyCode::Char('a') => self.modal = Some(Modal::Form(self.account_form(None))),
             KeyCode::Char('e') => {
                 if let Some(a) = sel {
@@ -956,6 +1118,7 @@ impl App {
                     profile_dir: None,
                     budget_usd_month: None,
                     enabled: true,
+                    effort: None,
                 };
                 if core.store.upsert_account(&core.vault, &a).await.is_ok() {
                     added.push(k.cli_binary().unwrap_or("cli").to_string());
@@ -1100,6 +1263,7 @@ impl App {
             },
             budget_usd_month,
             enabled: existing.map(|a| a.enabled).unwrap_or(true),
+            effort: None,
         })
     }
 
@@ -1322,6 +1486,7 @@ impl App {
         self.session_id = None;
         self.session_cost = 0.0;
         self.session_tokens = 0;
+        self.summary = None;
         self.tab = Tab::Chat;
         self.notice = Some("new session".into());
     }
@@ -1338,6 +1503,13 @@ impl App {
         self.sessions.clear();
         self.usage.clear();
         self.session_id = None;
+        self.summary = None;
+        self.pending_plan = None;
+        self.routing = Routing::default();
+        self.routing_ready = false;
+        self.models.clear();
+        self.models_err.clear();
+        self.models_asked.clear();
         self.target = None;
         self.modal = None;
         self.screen = Screen::Unlock(UnlockState {
@@ -1369,7 +1541,7 @@ impl App {
                     KeyCode::Esc => return,
                     KeyCode::Char('p') if ctrl => return,
                     KeyCode::Enter => Some(Tab::ALL[sel]),
-                    KeyCode::Char(c @ '1'..='5') => Some(Tab::ALL[c as usize - '1' as usize]),
+                    KeyCode::Char(c @ '1'..='6') => Some(Tab::ALL[c as usize - '1' as usize]),
                     KeyCode::Char(c) if !ctrl => Tab::ALL.into_iter().find(|t| t.mnemonic() == c),
                     _ => None,
                 };
@@ -1383,6 +1555,96 @@ impl App {
                     }
                     _ => self.modal = Some(Modal::Switcher(sel)),
                 }
+            }
+            Some(Modal::Picker(mut p)) => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                match k.code {
+                    KeyCode::Esc => {
+                        if let PickPurpose::FormModel(f) = p.purpose {
+                            self.modal = Some(Modal::Form(*f));
+                        }
+                        return;
+                    }
+                    KeyCode::Up => p.sel = p.sel.saturating_sub(1),
+                    KeyCode::Down => {
+                        let n = p.visible().len();
+                        p.sel = (p.sel + 1).min(n.saturating_sub(1));
+                    }
+                    KeyCode::Backspace => {
+                        p.filter.pop();
+                        p.sel = 0;
+                    }
+                    KeyCode::Enter => {
+                        let value = p.visible().get(p.sel).map(|i| i.1.clone()).or_else(|| {
+                            (p.free_text() && !p.filter.is_empty()).then(|| p.filter.clone())
+                        });
+                        if let Some(v) = value {
+                            self.apply_pick(p.purpose, v);
+                            return;
+                        }
+                    }
+                    KeyCode::Char(c) if !ctrl => {
+                        p.filter.push(c);
+                        p.sel = 0;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Picker(p));
+            }
+            Some(Modal::Plan) => {
+                let Some(mut pr) = self.pending_plan.take() else {
+                    return;
+                };
+                let n = pr.steps.len();
+                match k.code {
+                    KeyCode::Esc => {
+                        self.notice = Some("plan discarded".into());
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => pr.sel = pr.sel.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        pr.sel = (pr.sel + 1).min(n.saturating_sub(1))
+                    }
+                    KeyCode::Char('d') => {
+                        if n > 0 {
+                            pr.steps.remove(pr.sel);
+                        }
+                        if pr.steps.is_empty() {
+                            self.notice = Some("plan discarded".into());
+                            return;
+                        }
+                        pr.sel = pr.sel.min(pr.steps.len() - 1);
+                    }
+                    KeyCode::Char('e') => {
+                        if let Some(step) = pr.steps.get(pr.sel) {
+                            let f = Form::new(
+                                FormKind::PlanStep(pr.sel),
+                                format!("Edit step {}", pr.sel + 1),
+                                vec![Field::text(FieldId::StepText, "Task", step.task.clone())],
+                            );
+                            self.pending_plan = Some(pr);
+                            self.modal = Some(Modal::Form(f));
+                            return;
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        let f = Form::new(
+                            FormKind::PlanFeedback,
+                            "Ask the planner to revise",
+                            vec![Field::text(FieldId::Feedback, "Feedback", "")],
+                        );
+                        self.pending_plan = Some(pr);
+                        self.modal = Some(Modal::Form(f));
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        self.approve_plan(pr);
+                        return;
+                    }
+                    _ => {}
+                }
+                self.pending_plan = Some(pr);
+                self.modal = Some(Modal::Plan);
             }
             Some(Modal::Confirm { text, action }) => match k.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.confirm(action),
@@ -1402,6 +1664,24 @@ impl App {
                         }
                     }
                     KeyCode::Backspace => f.backspace(),
+                    KeyCode::Char('o') if ctrl && f.fields[f.focus].id == FieldId::Model => {
+                        let items = self.form_model_items(&f);
+                        if items.is_empty() {
+                            f.status = Some(
+                                "no model list yet - press m on the Accounts tab to fetch it"
+                                    .into(),
+                            );
+                        } else {
+                            self.modal = Some(Modal::Picker(Picker {
+                                title: "Model".into(),
+                                items,
+                                filter: String::new(),
+                                sel: 0,
+                                purpose: PickPurpose::FormModel(Box::new(f)),
+                            }));
+                            return;
+                        }
+                    }
                     KeyCode::Char('t') if ctrl => {
                         if let FormKind::Account { edit } = f.kind.clone() {
                             match self.account_from_form(&f, edit) {
@@ -1454,6 +1734,32 @@ impl App {
                     let _ = tx.send(Msg::RunDone);
                 });
                 self.active_runs += 1;
+            }
+            FormKind::PlanStep(i) => {
+                let text = f.value(FieldId::StepText);
+                if text.is_empty() {
+                    return Err("the task cannot be empty".into());
+                }
+                if let Some(step) = self
+                    .pending_plan
+                    .as_mut()
+                    .and_then(|pr| pr.steps.get_mut(i))
+                {
+                    step.task = text;
+                }
+            }
+            FormKind::PlanFeedback => {
+                let fb = f.value(FieldId::Feedback);
+                if fb.is_empty() {
+                    return Err("write what should change".into());
+                }
+                if let Some(pr) = self.pending_plan.take() {
+                    let prompt = format!(
+                        "{}\n\nFeedback on the previous plan (apply it): {fb}",
+                        pr.task
+                    );
+                    self.start_plan(false, prompt, pr.task);
+                }
             }
             FormKind::Passwd => {
                 let (pw, confirm) = (f.value(FieldId::NewPw), f.value(FieldId::ConfirmPw));
@@ -1594,6 +1900,7 @@ impl App {
             return;
         }
         // @name routing
+        let routed = text.starts_with('@');
         let (target, prompt) = match text.strip_prefix('@') {
             Some(rest) => match self.take_name(rest, false) {
                 Some((t, tail)) if !tail.trim().is_empty() => (Some(t), tail.trim().to_string()),
@@ -1608,6 +1915,20 @@ impl App {
             },
             None => (self.target, text),
         };
+        if !routed {
+            match self.mode {
+                Mode::Normal => {}
+                Mode::Plan => {
+                    self.start_plan(true, prompt.clone(), prompt);
+                    return;
+                }
+                Mode::Auto => {
+                    let shown = prompt.clone();
+                    self.orchestrate_task(prompt, shown);
+                    return;
+                }
+            }
+        }
         let Some(target) = target else {
             self.notice = Some(
                 "no account yet - press Tab, then 'a' to add one (or 'D' to detect local ones)"
@@ -1658,10 +1979,44 @@ impl App {
             req.model = Some(m.clone());
         }
 
+        // Old turns are folded into a running summary by the auxiliary account(s).
+        let policy = self.routing.policy.clone();
+        let aux = if self.routing.auxiliary.iter().any(|s| s.enabled) {
+            balance::rank(
+                &self.routing.auxiliary,
+                &self.accounts,
+                &self.usage,
+                self.now,
+                &policy,
+                None,
+            )
+        } else {
+            vec![]
+        };
+        let cut = (!aux.is_empty())
+            .then(|| {
+                compact::cut_point(
+                    &req.turns,
+                    policy.history_budget_tokens as usize,
+                    policy.keep_last_turns as usize,
+                )
+            })
+            .flatten();
+        let prev = self.summary.clone();
+        let msg_tx = self.tx.clone();
+
         self.push_user(&prompt);
         let lane = self.alloc_lanes(1);
         let who_agent = agent.as_ref().map(|a| a.name.clone());
         self.spawn_run(move |core, cancel, ui, session| async move {
+            let mut req = req;
+            if let Some(cut) = cut {
+                let summary = compact_history(&core, &req, cut, prev, aux, &cancel, &msg_tx).await;
+                if let Some(s) = summary {
+                    req.turns = compact::apply(&req.turns, &s.text, s.covered);
+                    let _ = msg_tx.send(Msg::Summary(s));
+                }
+            }
             if let Ok(out) = core.run(lane, chain, req, cancel, ui).await {
                 let m = Message {
                     role: Role::Assistant,
@@ -1687,6 +2042,18 @@ impl App {
 
     /// Ensures a session exists, persists the latest user entry, then runs `f`.
     fn spawn_run<F, Fut>(&mut self, f: F)
+    where
+        F: FnOnce(Core, CancellationToken, mpsc::UnboundedSender<(LaneId, RunEvent)>, Uuid) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_task(true, f)
+    }
+
+    /// Like `spawn_run`; `persist_user` is false when the user entry was already stored
+    /// (approving or revising a plan).
+    fn spawn_task<F, Fut>(&mut self, persist_user: bool, f: F)
     where
         F: FnOnce(Core, CancellationToken, mpsc::UnboundedSender<(LaneId, RunEvent)>, Uuid) -> Fut
             + Send
@@ -1719,13 +2086,15 @@ impl App {
             {
                 let _ = tx.send(Msg::Notice(format!("session: {e:#}")));
             }
-            let m = Message {
-                role: Role::User,
-                content: user_text,
-                agent_name: None,
-                account_name: None,
-            };
-            let _ = core.store.append_message(&core.vault, session, &m).await;
+            if persist_user {
+                let m = Message {
+                    role: Role::User,
+                    content: user_text,
+                    agent_name: None,
+                    account_name: None,
+                };
+                let _ = core.store.append_message(&core.vault, session, &m).await;
+            }
             f(core, cancel, ui, session).await;
             let _ = tx.send(Msg::RunDone);
         });
@@ -1755,7 +2124,9 @@ impl App {
             "clear" => {
                 self.entries.clear();
                 self.lanes.clear();
+                self.summary = None;
             }
+            "plan" => self.toggle_plan_mode(),
             "quit" | "exit" | "q" => self.quit = true,
             "lock" => self.lock(),
             "passwd" => {
@@ -1772,7 +2143,25 @@ impl App {
                 self.modal = Some(Modal::Form(f));
             }
             "model" => {
-                self.model_override = Some(rest.to_string()).filter(|s| !s.is_empty());
+                if rest.is_empty() {
+                    let items = self.all_model_items();
+                    if items.is_empty() {
+                        self.notice = Some(
+                            "no model lists yet - press m on the Accounts tab, or /model <name>"
+                                .into(),
+                        );
+                    } else {
+                        self.modal = Some(Modal::Picker(Picker {
+                            title: "Model for the chat".into(),
+                            items,
+                            filter: String::new(),
+                            sel: 0,
+                            purpose: PickPurpose::ChatModel,
+                        }));
+                    }
+                    return;
+                }
+                self.model_override = Some(rest.to_string()).filter(|s| s != "reset");
                 self.notice = Some(match &self.model_override {
                     Some(m) => format!("model override: {m}"),
                     None => "model override cleared".into(),
@@ -1864,17 +2253,23 @@ impl App {
             self.notice = Some("usage: /orchestrate <task>".into());
             return;
         }
-        let Some((chain, _)) = self.target.and_then(|t| self.chain_for_target(t)) else {
-            self.notice = Some("choose a planner first with /use".into());
-            return;
+        self.orchestrate_task(task.to_string(), format!("/orchestrate {task}"));
+    }
+
+    /// Plan → execute → synthesize without review. `shown` is the user line in the chat.
+    fn orchestrate_task(&mut self, task: String, shown: String) {
+        let team = match self.team() {
+            Ok(t) => t,
+            Err(e) => {
+                self.notice = Some(e);
+                return;
+            }
         };
-        let (agents, accounts, task) =
-            (self.agents.clone(), self.accounts.clone(), task.to_string());
-        self.push_user(&format!("/orchestrate {task}"));
+        let context = self.summary.as_ref().map(|s| s.text.clone());
+        self.push_user(&shown);
         let base = self.alloc_lanes(64);
         self.spawn_run(move |core, cancel, ui, session| async move {
-            let r =
-                modes::orchestrate(&core, agents, accounts, chain, task, base, cancel, ui).await;
+            let r = modes::orchestrate(&core, team, task, context, base, cancel, ui).await;
             if let Ok(o) = r.final_text {
                 let m = Message {
                     role: Role::Assistant,
@@ -1886,6 +2281,396 @@ impl App {
             }
         });
     }
+
+    // ------------------------------------------------------------------ routing, plan mode
+
+    /// Planner/executor/synthesizer accounts for a multi-step run. The planner comes from the
+    /// Routing tab, or from the active target when none is configured.
+    fn team(&mut self) -> Result<modes::Team, String> {
+        let policy = self.routing.policy.clone();
+        let rank = |slots: &[Slot], prefer, app: &Self| {
+            balance::rank(slots, &app.accounts, &app.usage, app.now, &policy, prefer)
+        };
+        let planner = if self.routing.planner.iter().any(|s| s.enabled) {
+            rank(&self.routing.planner, self.planner_last, self)
+        } else {
+            self.target
+                .and_then(|t| self.chain_for_target(t))
+                .map(|(c, _)| c)
+                .unwrap_or_default()
+        };
+        if planner.is_empty() {
+            return Err(
+                "no planner available: set one on the Routing tab or choose a target with /use"
+                    .into(),
+            );
+        }
+        self.planner_last = planner.first().map(|a| a.id);
+        Ok(modes::Team {
+            agents: self.agents.clone(),
+            accounts: self.accounts.clone(),
+            synth: rank(&self.routing.synthesizer, None, self),
+            planner,
+            pool: self.routing.executors.clone(),
+            usage: self.usage.clone(),
+            now: self.now,
+            policy,
+        })
+    }
+
+    /// `Shift+Tab` in Chat, like Claude Code's mode cycling: normal → plan → auto.
+    fn cycle_mode(&mut self) {
+        self.set_mode(match self.mode {
+            Mode::Normal => Mode::Plan,
+            Mode::Plan => Mode::Auto,
+            Mode::Auto => Mode::Normal,
+        });
+    }
+
+    fn toggle_plan_mode(&mut self) {
+        self.set_mode(if self.mode == Mode::Plan {
+            Mode::Normal
+        } else {
+            Mode::Plan
+        });
+    }
+
+    fn set_mode(&mut self, m: Mode) {
+        self.mode = m;
+        self.notice = Some(
+            match m {
+                Mode::Normal => "mode: chat - messages go straight to the target",
+                Mode::Plan => "mode: plan - messages are planned, reviewed by you, then executed",
+                Mode::Auto => "mode: auto - messages are planned and executed without review",
+            }
+            .into(),
+        );
+    }
+
+    /// Asks the planner for steps; the review modal opens when they arrive.
+    /// `task` is what the planner is told, `original` what the user typed.
+    fn start_plan(&mut self, persist_user: bool, task: String, original: String) {
+        let team = match self.team() {
+            Ok(t) => t,
+            Err(e) => {
+                self.notice = Some(e);
+                return;
+            }
+        };
+        if persist_user {
+            self.push_user(&original);
+        }
+        let context = self.summary.as_ref().map(|s| s.text.clone());
+        let base = self.alloc_lanes(64);
+        let tx = self.tx.clone();
+        self.spawn_task(persist_user, move |core, cancel, ui, _session| async move {
+            match modes::plan(&core, &team, &task, context.as_deref(), base, cancel, ui).await {
+                Ok(steps) => {
+                    let _ = tx.send(Msg::PlanReady {
+                        task: original,
+                        steps,
+                        base,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Notice(e));
+                }
+            }
+        });
+    }
+
+    fn approve_plan(&mut self, pr: PlanReview) {
+        let team = match self.team() {
+            Ok(t) => t,
+            Err(e) => {
+                self.notice = Some(e);
+                return;
+            }
+        };
+        let PlanReview {
+            task, steps, base, ..
+        } = pr;
+        self.spawn_task(false, move |core, cancel, ui, session| async move {
+            let listing = steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let who = if s.agent.is_empty() {
+                        String::new()
+                    } else {
+                        format!("@{}: ", s.agent)
+                    };
+                    format!("{}. {who}{}", i + 1, s.task)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let m = Message {
+                role: Role::Assistant,
+                content: format!("Approved plan:\n{listing}"),
+                agent_name: Some("planner".into()),
+                account_name: None,
+            };
+            let _ = core.store.append_message(&core.vault, session, &m).await;
+            let r = modes::run_steps(&core, &team, &task, steps, base, cancel, ui).await;
+            if let Ok(o) = r.final_text {
+                let m = Message {
+                    role: Role::Assistant,
+                    content: o.text,
+                    agent_name: None,
+                    account_name: Some(o.account),
+                };
+                let _ = core.store.append_message(&core.vault, session, &m).await;
+            }
+        });
+    }
+
+    pub fn routing_rows(&self) -> Vec<RoutingRow> {
+        let mut rows = vec![];
+        for sec in 0..4 {
+            rows.push(RoutingRow::Header(sec));
+            rows.extend((0..self.routing.section(sec).len()).map(|i| RoutingRow::Slot(sec, i)));
+        }
+        rows.extend((0..POLICY_ROWS).map(RoutingRow::Policy));
+        rows
+    }
+
+    fn save_routing(&mut self) {
+        let Some(core) = self.core.clone() else {
+            return;
+        };
+        let (r, tx) = (self.routing.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            if let Err(e) = core.store.save_setting(&core.vault, "routing", &r).await {
+                let _ = tx.send(Msg::Notice(format!("saving routing: {e:#}")));
+            }
+        });
+    }
+
+    fn fetch_models(&mut self, a: Account) {
+        self.models_asked.insert(a.id);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = providers::catalog::list_models(&a)
+                .await
+                .map_err(|e| e.message);
+            let _ = tx.send(Msg::Models(a.id, r));
+        });
+    }
+
+    /// `account › model` for every known model, used by `/model`.
+    fn all_model_items(&self) -> Vec<(String, String)> {
+        self.accounts
+            .iter()
+            .flat_map(|a| {
+                self.models
+                    .get(&a.id)
+                    .into_iter()
+                    .flatten()
+                    .map(move |m| (format!("{} › {m}", a.name), m.clone()))
+            })
+            .collect()
+    }
+
+    fn form_model_items(&self, f: &Form) -> Vec<(String, String)> {
+        if let FormKind::Account { edit: Some(id) } = &f.kind
+            && let Some(list) = self.models.get(id)
+        {
+            return list.iter().map(|m| (m.clone(), m.clone())).collect();
+        }
+        self.all_model_items()
+    }
+
+    fn open_slot_model_picker(&mut self, sec: usize, i: usize) {
+        let Some(slot) = self.routing.section(sec).get(i) else {
+            return;
+        };
+        let id = slot.account_id;
+        let mut items = vec![("(account default)".to_string(), String::new())];
+        items.extend(
+            self.models
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .map(|m| (m.clone(), m.clone())),
+        );
+        if items.len() == 1 {
+            self.notice = Some(match self.models_err.get(&id) {
+                Some(e) => format!("no model list: {e} (type a name to set it)"),
+                None => "no model list yet - type a name to set it".into(),
+            });
+        }
+        self.modal = Some(Modal::Picker(Picker {
+            title: "Model for this slot".into(),
+            items,
+            filter: String::new(),
+            sel: 0,
+            purpose: PickPurpose::SlotModel(sec, i),
+        }));
+    }
+
+    fn apply_pick(&mut self, purpose: PickPurpose, value: String) {
+        match purpose {
+            PickPurpose::AddSlot(sec) => {
+                if let Ok(id) = value.parse::<Uuid>() {
+                    self.routing.section_mut(sec).push(Slot::new(id));
+                    self.save_routing();
+                    self.notice = Some("added - press m to choose its model".into());
+                }
+            }
+            PickPurpose::SlotModel(sec, i) => {
+                if let Some(slot) = self.routing.section_mut(sec).get_mut(i) {
+                    slot.model = Some(value).filter(|m| !m.is_empty());
+                    self.save_routing();
+                }
+            }
+            PickPurpose::ChatModel => {
+                self.notice = Some(format!("model override: {value}"));
+                self.model_override = Some(value);
+            }
+            PickPurpose::FormModel(mut f) => {
+                if let Some(fld) = f.fields.iter_mut().find(|x| x.id == FieldId::Model) {
+                    fld.value = value;
+                }
+                self.modal = Some(Modal::Form(*f));
+            }
+        }
+    }
+
+    fn on_key_routing(&mut self, k: KeyEvent) {
+        let rows = self.routing_rows();
+        let Some(row) = rows.get(self.sel[Tab::Routing.index()]).copied() else {
+            return;
+        };
+        let (sec, idx) = match row {
+            RoutingRow::Header(s) => (Some(s), None),
+            RoutingRow::Slot(s, i) => (Some(s), Some(i)),
+            RoutingRow::Policy(_) => (None, None),
+        };
+        match (k.code, row) {
+            (KeyCode::Char('a'), _) if sec.is_some() => {
+                let items: Vec<(String, String)> = self
+                    .accounts
+                    .iter()
+                    .filter(|a| a.enabled)
+                    .map(|a| (format!("{} ({})", a.name, a.kind.short()), a.id.to_string()))
+                    .collect();
+                if items.is_empty() {
+                    self.notice = Some("add an account first".into());
+                } else {
+                    self.modal = Some(Modal::Picker(Picker {
+                        title: format!(
+                            "Add to {}",
+                            ROUTING_SECTIONS[sec.unwrap_or(0)].to_lowercase()
+                        ),
+                        items,
+                        filter: String::new(),
+                        sel: 0,
+                        purpose: PickPurpose::AddSlot(sec.unwrap_or(0)),
+                    }));
+                }
+            }
+            (KeyCode::Char('m'), RoutingRow::Slot(s, i)) => self.open_slot_model_picker(s, i),
+            (KeyCode::Char('f'), RoutingRow::Slot(s, i)) => {
+                const LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+                let kind = self
+                    .routing
+                    .section(s)
+                    .get(i)
+                    .and_then(|sl| self.accounts.iter().find(|a| a.id == sl.account_id))
+                    .map(|a| a.kind);
+                if kind != Some(ProviderKind::ClaudeCli) {
+                    self.notice = Some("effort applies to Claude Code accounts only".into());
+                } else if let Some(slot) = self.routing.section_mut(s).get_mut(i) {
+                    slot.effort = match slot.effort.as_deref() {
+                        None | Some("") => Some(LEVELS[0].to_string()),
+                        Some(cur) => LEVELS
+                            .iter()
+                            .position(|l| *l == cur)
+                            .and_then(|p| LEVELS.get(p + 1))
+                            .map(|l| l.to_string()),
+                    };
+                    self.save_routing();
+                }
+            }
+            (KeyCode::Char(' '), RoutingRow::Slot(s, i)) => {
+                if let Some(slot) = self.routing.section_mut(s).get_mut(i) {
+                    slot.enabled = !slot.enabled;
+                    self.save_routing();
+                }
+            }
+            (KeyCode::Char('J'), RoutingRow::Slot(s, i)) => {
+                let v = self.routing.section_mut(s);
+                if i + 1 < v.len() {
+                    v.swap(i, i + 1);
+                    self.sel[Tab::Routing.index()] += 1;
+                    self.save_routing();
+                }
+            }
+            (KeyCode::Char('K'), RoutingRow::Slot(s, i)) if i > 0 => {
+                self.routing.section_mut(s).swap(i, i - 1);
+                self.sel[Tab::Routing.index()] -= 1;
+                self.save_routing();
+            }
+            (KeyCode::Char('d') | KeyCode::Delete, RoutingRow::Slot(s, i)) => {
+                self.routing.section_mut(s).remove(i);
+                self.save_routing();
+            }
+            (KeyCode::Char('+' | '=' | ' '), RoutingRow::Policy(n)) => self.adjust_policy(n, 1),
+            (KeyCode::Char('-'), RoutingRow::Policy(n)) => self.adjust_policy(n, -1),
+            _ => {}
+        }
+        let _ = idx;
+    }
+
+    fn adjust_policy(&mut self, row: usize, d: i32) {
+        let p = &mut self.routing.policy;
+        match row {
+            0 => p.skip_above = ((p.skip_above + 0.05 * d as f64) * 100.0).round() / 100.0,
+            1 => p.prefer_local = !p.prefer_local,
+            2 => {
+                p.history_budget_tokens =
+                    (p.history_budget_tokens as i64 + 4_000 * d as i64).clamp(2_000, 200_000) as u32
+            }
+            _ => p.keep_last_turns = (p.keep_last_turns as i32 + d).clamp(2, 30) as u8,
+        }
+        p.skip_above = p.skip_above.clamp(0.30, 1.0);
+        self.save_routing();
+    }
+}
+
+/// Folds the old part of `req.turns` into a summary with the auxiliary chain.
+/// Reuses `prev` when fewer than 4 turns have piled up since it was written.
+async fn compact_history(
+    core: &Core,
+    req: &ChatRequest,
+    cut: usize,
+    prev: Option<compact::Summary>,
+    aux: Vec<Account>,
+    cancel: &CancellationToken,
+    tx: &mpsc::UnboundedSender<Msg>,
+) -> Option<compact::Summary> {
+    if let Some(p) = prev
+        .as_ref()
+        .filter(|p| cut.saturating_sub(p.covered) < 4 && p.covered < req.turns.len())
+    {
+        return Some(p.clone());
+    }
+    let fresh = compact::to_summarize(&req.turns, cut, prev.as_ref());
+    let prompt = compact::summary_prompt(prev.as_ref(), &fresh);
+    let _ = tx.send(Msg::Notice("summarizing older messages...".into()));
+    let (quiet_tx, _quiet_rx) = mpsc::unbounded_channel();
+    let out = core
+        .run(
+            0,
+            aux,
+            modes::user_req(None, prompt),
+            cancel.clone(),
+            quiet_tx,
+        )
+        .await
+        .ok()?;
+    let text = out.text.trim().to_string();
+    (!text.is_empty()).then_some(compact::Summary { text, covered: cut })
 }
 
 #[cfg(test)]

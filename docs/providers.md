@@ -69,6 +69,14 @@ The Claude Code CLI prints a `rate_limit_event` in its `stream-json` output when
 - The reading is a snapshot from the last request. If a window's reset time has passed, it is shown as `0% (reset)`. Press `p` in the Usage tab to refresh it.
 - The event is not a documented, stable interface. The parser ignores anything it does not recognize, so a format change makes the panel show `no data` instead of failing requests.
 
+## Model discovery
+
+`providers/catalog.rs` lists the models of each account for the model picker (see the [usage guide](usage.md#choosing-models)): Ollama `/api/tags`, OpenAI-compatible `GET /models`, the `genai` model-list call for API providers, `agy models` for Antigravity, and a static list for Claude Code, Codex and Gemini CLI, whose CLIs have no listing command. Lists are fetched once per unlock and when you press `m` in the Accounts tab; a failure only means the picker offers free text.
+
+## Effort (Claude Code)
+
+A routing slot can carry an effort level. It is passed as `claude --effort <level>` (`low`, `medium`, `high`, `xhigh`, `max`) and is not stored on the account itself. Antigravity encodes effort in the model name (`…-low`, `…-medium`, `…-high`).
+
 ## Pricing
 
 Cost for API accounts = `tokens_in × input + tokens_out × output` per 1M tokens, looked up by the **longest model-name prefix** in:

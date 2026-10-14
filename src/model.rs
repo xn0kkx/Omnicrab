@@ -174,6 +174,9 @@ pub struct Account {
     pub profile_dir: Option<String>,
     #[serde(default)]
     pub budget_usd_month: Option<f64>,
+    /// Claude Code `--effort` level; set per role slot, not by the account form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default = "yes")]
     pub enabled: bool,
 }
@@ -224,6 +227,115 @@ pub struct Agent {
     #[serde(default)]
     pub fallback_account_ids: Vec<Uuid>,
 }
+
+/// One account (and optionally a model/effort on it) assigned to a role.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Slot {
+    pub account_id: Uuid,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Claude Code only: `low`, `medium`, `high`, `xhigh` or `max`.
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+impl Slot {
+    pub fn new(account_id: Uuid) -> Self {
+        Self {
+            account_id,
+            model: None,
+            effort: None,
+            enabled: true,
+        }
+    }
+}
+
+/// Which accounts are skipped, preferred and how much history is kept.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BalancePolicy {
+    /// Accounts whose plan/budget use is above this fraction go to the end of the chain.
+    #[serde(default = "default_skip_above")]
+    pub skip_above: f64,
+    /// Rank local models (cost 0) first.
+    #[serde(default)]
+    pub prefer_local: bool,
+    /// Estimated tokens of history above which old turns are summarized.
+    #[serde(default = "default_history_budget")]
+    pub history_budget_tokens: u32,
+    /// Recent turns that are always sent verbatim.
+    #[serde(default = "default_keep_turns")]
+    pub keep_last_turns: u8,
+}
+
+fn default_skip_above() -> f64 {
+    0.85
+}
+fn default_history_budget() -> u32 {
+    24_000
+}
+fn default_keep_turns() -> u8 {
+    6
+}
+
+impl Default for BalancePolicy {
+    fn default() -> Self {
+        Self {
+            skip_above: default_skip_above(),
+            prefer_local: false,
+            history_budget_tokens: default_history_budget(),
+            keep_last_turns: default_keep_turns(),
+        }
+    }
+}
+
+/// Who plans, who executes, who merges and who does the cheap housekeeping.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Routing {
+    #[serde(default)]
+    pub planner: Vec<Slot>,
+    #[serde(default)]
+    pub executors: Vec<Slot>,
+    /// Empty means the planner chain is used.
+    #[serde(default)]
+    pub synthesizer: Vec<Slot>,
+    /// History summaries and other cheap tasks.
+    #[serde(default)]
+    pub auxiliary: Vec<Slot>,
+    #[serde(default)]
+    pub policy: BalancePolicy,
+}
+
+impl Routing {
+    pub fn section(&self, i: usize) -> &Vec<Slot> {
+        match i {
+            0 => &self.planner,
+            1 => &self.executors,
+            2 => &self.synthesizer,
+            _ => &self.auxiliary,
+        }
+    }
+
+    pub fn section_mut(&mut self, i: usize) -> &mut Vec<Slot> {
+        match i {
+            0 => &mut self.planner,
+            1 => &mut self.executors,
+            2 => &mut self.synthesizer,
+            _ => &mut self.auxiliary,
+        }
+    }
+
+    /// Drops slots that point at deleted accounts.
+    pub fn prune(&mut self, accounts: &[Account]) {
+        for i in 0..4 {
+            self.section_mut(i)
+                .retain(|s| accounts.iter().any(|a| a.id == s.account_id));
+        }
+    }
+}
+
+pub const ROUTING_SECTIONS: [&str; 4] = ["Planner", "Executors", "Synthesizer", "Auxiliary"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -336,10 +448,24 @@ mod tests {
             profile_dir: None,
             budget_usd_month: Some(10.0),
             enabled: true,
+            effort: None,
         };
         let j = serde_json::to_vec(&a).unwrap();
         let b: Account = serde_json::from_slice(&j).unwrap();
         assert_eq!(b.api_key.unwrap().expose_secret(), "sk-test-1234567890");
+    }
+
+    #[test]
+    fn routing_roundtrip_and_defaults() {
+        let r: Routing = serde_json::from_str("{}").unwrap();
+        assert!(r.planner.is_empty() && r.executors.is_empty());
+        assert_eq!(r.policy.skip_above, 0.85);
+        let mut r = Routing::default();
+        r.executors.push(Slot::new(Uuid::new_v4()));
+        let j = serde_json::to_vec(&r).unwrap();
+        assert_eq!(serde_json::from_slice::<Routing>(&j).unwrap(), r);
+        r.prune(&[]);
+        assert!(r.executors.is_empty());
     }
 
     #[test]

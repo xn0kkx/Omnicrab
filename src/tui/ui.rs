@@ -129,6 +129,7 @@ fn draw_main(f: &mut Frame, app: &App) {
         Tab::Agents => draw_agents(f, app, body),
         Tab::Usage => draw_usage(f, app, body),
         Tab::Sessions => draw_sessions(f, app, body),
+        Tab::Routing => draw_routing(f, app, body),
     }
     draw_status(f, app, status);
     match &app.modal {
@@ -153,6 +154,12 @@ fn draw_main(f: &mut Frame, app: &App) {
         }
         Some(Modal::Help) => draw_help(f),
         Some(Modal::Switcher(sel)) => draw_switcher(f, *sel, app.tab),
+        Some(Modal::Picker(p)) => draw_picker(f, p),
+        Some(Modal::Plan) => {
+            if let Some(pr) = &app.pending_plan {
+                draw_plan(f, pr)
+            }
+        }
         None => {}
     }
 }
@@ -180,6 +187,17 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         format!(" {} ", target_label(app)),
         Style::new().bg(ACCENT).fg(Color::Black).bold(),
     )];
+    let (label, color) = match app.mode {
+        Mode::Normal => ("", Color::Reset),
+        Mode::Plan => (" PLAN ", Color::Cyan),
+        Mode::Auto => (" AUTO ", Color::Magenta),
+    };
+    if !label.is_empty() {
+        spans.push(Span::styled(
+            label,
+            Style::new().bg(color).fg(Color::Black).bold(),
+        ));
+    }
     if let Some(m) = &app.model_override {
         spans.push(Span::raw(format!(" model={m}")));
     }
@@ -888,7 +906,9 @@ fn draw_form(f: &mut Frame, form: &Form) {
     }
     lines.push(Line::raw(""));
     let keys = if matches!(form.kind, FormKind::Account { .. }) {
-        "Enter save · Ctrl+T test · Tab next · Esc cancel"
+        "Enter save · Ctrl+T test · Ctrl+O pick model · Tab next · Esc cancel"
+    } else if matches!(form.kind, FormKind::Agent { .. }) {
+        "Enter save · Ctrl+O pick model · Tab next · Esc cancel"
     } else {
         "Enter save · Tab next · Esc cancel"
     };
@@ -918,14 +938,20 @@ fn draw_form(f: &mut Frame, form: &Form) {
 }
 
 fn draw_help(f: &mut Frame) {
-    let a = centered(f.area(), 84, 33);
+    let a = centered(f.area(), 96, 37);
     f.render_widget(Clear, a);
     let mut t: Vec<Line> = vec![
         Line::from("Keys".fg(ACCENT).bold()),
         Line::raw(
             "  Ctrl+P          quick tab switcher (c/a/g/u/s or 1-5)   Ctrl+←/→ prev/next tab",
         ),
-        Line::raw("  F1-F5 / Tab     switch tabs · click a tab with the mouse"),
+        Line::raw("  F1-F6 / Tab     switch tabs · click a tab with the mouse"),
+        Line::raw(
+            "  Shift+Tab       cycle chat / plan / auto mode · Ctrl+O or /plan toggles plan · /model picker",
+        ),
+        Line::raw(
+            "  Routing tab:    a add · m model · f effort · Space on/off · J/K move · d remove · +/- policy",
+        ),
         Line::raw("  Ctrl+N          new session         Ctrl+L lock vault"),
         Line::raw("  Usage tab:      t window · r reload · p refresh plan limits of the account"),
         Line::raw("  Esc             cancel running requests · Ctrl+C cancel, or quit when idle"),
@@ -954,5 +980,212 @@ fn draw_help(f: &mut Frame) {
                 .border_style(Style::new().fg(ACCENT)),
         ),
         a.inner(Margin::new(0, 0)),
+    );
+}
+
+// ---------------------------------------------------------------- routing
+
+fn room_bar(room: Option<f64>) -> Span<'static> {
+    match room {
+        Some(r) => {
+            let n = (r.clamp(0.0, 1.0) * 10.0).round() as usize;
+            Span::styled(
+                format!(
+                    "{}{} {:>3.0}% free",
+                    "█".repeat(n),
+                    "░".repeat(10 - n),
+                    r * 100.0
+                ),
+                Style::new().fg(pct_color(1.0 - r)),
+            )
+        }
+        None => Span::styled("░░░░░░░░░░ n/a", DIM),
+    }
+}
+
+fn draw_routing(f: &mut Frame, app: &App, area: Rect) {
+    let rows = app.routing_rows();
+    let sel = app.sel[Tab::Routing.index()];
+    let hints = [
+        "plans the work; keep this strong",
+        "pool for steps without a named agent; spread by free capacity",
+        "merges results (empty = planner); skipped when there is one step",
+        "summaries of old messages; a local model is ideal",
+    ];
+    let p = &app.routing.policy;
+    let mut lines: Vec<Line> = vec![];
+    for (n, row) in rows.iter().enumerate() {
+        let hi = if n == sel {
+            Style::new().bg(Color::Rgb(50, 50, 60)).bold()
+        } else {
+            Style::new()
+        };
+        let mark = if n == sel { "▶ " } else { "  " };
+        let line = match *row {
+            RoutingRow::Header(s) => {
+                let count = app.routing.section(s).len();
+                Line::from(vec![
+                    Span::styled(mark, hi),
+                    Span::styled(
+                        format!("{} ({count})", ROUTING_SECTIONS[s]),
+                        Style::new().fg(ACCENT).bold(),
+                    ),
+                    Span::styled(format!("  {}", hints[s]), DIM),
+                ])
+            }
+            RoutingRow::Slot(s, i) => {
+                let slot = &app.routing.section(s)[i];
+                let acct = app.accounts.iter().find(|a| a.id == slot.account_id);
+                let name = acct.map(|a| a.name.as_str()).unwrap_or("?");
+                let room = acct.and_then(|a| {
+                    crate::orchestrator::balance::headroom(a, app.usage.get(&a.id), app.now)
+                });
+                let model = slot
+                    .model
+                    .clone()
+                    .or_else(|| acct.map(|a| a.model.clone()).filter(|m| !m.is_empty()))
+                    .unwrap_or_else(|| "(cli default)".into());
+                let effort = slot
+                    .effort
+                    .as_deref()
+                    .map(|e| format!(" effort={e}"))
+                    .unwrap_or_default();
+                let base = if slot.enabled { Style::new() } else { DIM };
+                Line::from(vec![
+                    Span::styled(mark, hi),
+                    Span::styled(
+                        format!(
+                            "  {} {:<22} {:<28}{effort:<14} ",
+                            if slot.enabled { "●" } else { "○" },
+                            name,
+                            model
+                        ),
+                        base,
+                    ),
+                    room_bar(room),
+                ])
+            }
+            RoutingRow::Policy(n) => {
+                let (label, value) = match n {
+                    0 => (
+                        "skip accounts above",
+                        format!("{:.0}% used", p.skip_above * 100.0),
+                    ),
+                    1 => (
+                        "prefer local models",
+                        (if p.prefer_local { "yes" } else { "no" }).into(),
+                    ),
+                    2 => (
+                        "summarize history above",
+                        format!("~{} tokens", p.history_budget_tokens),
+                    ),
+                    _ => ("keep last turns verbatim", p.keep_last_turns.to_string()),
+                };
+                Line::from(vec![
+                    Span::styled(mark, hi),
+                    Span::styled(
+                        if n == 0 { "Policy  " } else { "        " },
+                        Style::new().fg(ACCENT).bold(),
+                    ),
+                    Span::raw(format!("{label:<26}{value}")),
+                ])
+            }
+        };
+        lines.push(line);
+    }
+    let visible = area.height.saturating_sub(2) as usize;
+    let skip = (sel + 1).saturating_sub(visible);
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()).block(table_block(
+            "Routing",
+            "a add · m model · f effort · Space on/off · J/K move · d remove · +/- policy · ?",
+        )),
+        area,
+    );
+}
+
+fn draw_picker(f: &mut Frame, p: &Picker) {
+    let items = p.visible();
+    let h = (items.len().min(14) as u16 + 5).max(7);
+    let a = centered(f.area(), 70, h);
+    f.render_widget(Clear, a);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("filter: ", DIM),
+        Span::raw(format!("{}▏", p.filter)),
+    ])];
+    let skip = (p.sel + 1).saturating_sub(14);
+    for (i, (label, _)) in items.iter().enumerate().skip(skip).take(14) {
+        let style = if i == p.sel {
+            Style::new().bg(ACCENT).fg(Color::Black).bold()
+        } else {
+            Style::new()
+        };
+        lines.push(Line::from(Span::styled(format!(" {label}"), style)));
+    }
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if p.filter.is_empty() {
+                " (nothing to pick)".to_string()
+            } else {
+                format!(" no match - Enter uses \"{}\" as typed", p.filter)
+            },
+            DIM,
+        )));
+    }
+    lines.push(Line::from(
+        " type to filter · ↑↓ · Enter · Esc".fg(Color::DarkGray),
+    ));
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(format!(" {} ", p.title))
+                .border_style(Style::new().fg(ACCENT)),
+        ),
+        a,
+    );
+}
+
+fn draw_plan(f: &mut Frame, pr: &PlanReview) {
+    let a = centered(
+        f.area(),
+        90,
+        (pr.steps.len() as u16 * 5 + 4).min(f.area().height),
+    );
+    f.render_widget(Clear, a);
+    let mut lines: Vec<Line> = vec![];
+    for (i, s) in pr.steps.iter().enumerate() {
+        let hi = if i == pr.sel {
+            Style::new().bg(Color::Rgb(50, 50, 60)).bold()
+        } else {
+            Style::new()
+        };
+        let who = if s.agent.is_empty() {
+            "executor pool".to_string()
+        } else {
+            format!("@{}", s.agent)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if i == pr.sel { "▶ " } else { "  " }, hi),
+            Span::styled(
+                format!("{}. {who}", i + 1),
+                Style::new().fg(Color::Cyan).bold(),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(format!("     {}", s.task), hi)));
+        lines.push(Line::raw(""));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .title(" Plan review ")
+                    .title_bottom(Line::from(
+                        " Enter approve · e edit · d remove · r revise · ↑↓ · Esc discard "
+                            .fg(Color::DarkGray),
+                    ))
+                    .border_style(Style::new().fg(Color::Cyan)),
+            )
+            .wrap(Wrap { trim: false }),
+        a,
     );
 }

@@ -11,7 +11,8 @@ omnicrab is a single Rust binary. The UI never calls providers directly: it talk
         ┌───────▼────────┐  run()   ┌────────────────────┐       │
         │ orchestrator   ├─────────►│ providers          │       │
         │ failover,budget│ stream   │  genai_backend (HTTP)      │
-        │ fan-out, plan  │◄─────────┤  cli_backend (subprocess)  │
+        │ balance, plan  │◄─────────┤  cli_backend (subprocess)  │
+        │ compact, fanout│          │  catalog (model lists)     │
         └───────┬────────┘ events   │  ollama_discovery  │       │
                 │ usage/messages    └────────────────────┘       │
         ┌───────▼────────┐ seal/open ┌─────────┐                  │
@@ -33,9 +34,12 @@ omnicrab is a single Rust binary. The UI never calls providers directly: it talk
 | `src/store/mod.rs` | PostgreSQL access; every payload column goes through the vault |
 | `src/providers/` | `stream_chat`, `complete`, `test_connection`; HTTP and CLI backends |
 | `src/orchestrator/mod.rs` | `Core::run`: failover chain, budgets, usage recording |
-| `src/orchestrator/modes.rs` | Fan-out and plan → workers → synthesis |
+| `src/orchestrator/modes.rs` | Fan-out; `plan`, `execute`, `synthesize` (and `orchestrate` = all three) |
+| `src/orchestrator/balance.rs` | Pure ranking of role slots by free capacity; spreads parallel steps |
+| `src/orchestrator/compact.rs` | History-size estimate, cut point, summary prompt (pure) |
+| `src/providers/catalog.rs` | Lists the models of an account for the pickers |
 | `src/usage.rs` | Price table, time windows, aggregation, latest plan-limit snapshot per account |
-| `src/tui/` | `app` (state/events), `ui` (rendering), `form` (modal forms), `crab` (chat mascot animation) |
+| `src/tui/` | `app` (state/events, plan review, routing keys), `ui` (rendering), `form` (modal forms), `crab` (chat mascot animation) |
 
 ## Event flow for one chat message
 
@@ -44,6 +48,14 @@ omnicrab is a single Rust binary. The UI never calls providers directly: it talk
 3. `Core::run` iterates the chain. For each account it checks enabled/budget, streams from the provider, forwards `RunEvent`s on the UI channel and records a `UsageEvent`.
 4. On a failover-class error with no text yet shown, it moves to the next account; otherwise it finishes or reports the failure.
 5. The finished answer is stored as an encrypted message; `Msg::RunDone` triggers a reload of accounts, agents, sessions and usage.
+
+### Plan mode
+
+With plan mode on, `submit` builds a `modes::Team` (planner/synthesizer chains ranked by `balance::rank`, executor pool slots, a usage snapshot) and runs `modes::plan` in a task. The steps come back as `Msg::PlanReady`, which stores `App::pending_plan` and opens the review modal. Approval runs `modes::run_steps` (`execute` + `synthesize`) with the lanes reserved at planning time. Editing a step or asking for a revision goes through small forms (`FormKind::PlanStep`, `PlanFeedback`); closing them returns to the review.
+
+### History compaction
+
+Before a chat request, if the estimated history exceeds `BalancePolicy::history_budget_tokens` and an Auxiliary slot exists, `compact_history` (in `tui/app.rs`) asks the auxiliary chain to update a running summary of turns `1..=cut`. The request then carries turn 0, the summary and the turns after `cut`. The summary lives in `App::summary` and is reused until 4 more turns pile up.
 
 A **lane** is one logical request. Chat uses one lane; `/fanout` one per account; `/orchestrate` a block of lanes (planner, workers, synthesis). The UI creates one chat entry per lane on its first event.
 
@@ -65,6 +77,7 @@ A **lane** is one logical request. Chat uses one lane; `/fanout` one per account
 | `sessions` | `id`, `created_at` | title |
 | `messages` | `id`, `session_id`, `seq`, `created_at` | role, content, agent/account names |
 | `usage_events` | `id`, `account_id`, `created_at` | model, tokens, cost, latency, status |
+| `settings` (`0002`) | `key` (`routing`), `id`, `updated_at` | the `Routing` document: role slots (account ids, models, effort) and balance policy |
 
 Usage is aggregated in memory after decryption, which is fine at personal scale.
 

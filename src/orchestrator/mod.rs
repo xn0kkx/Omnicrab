@@ -1,5 +1,7 @@
 //! Runs requests across accounts: failover, budgets, usage accounting.
 
+pub mod balance;
+pub mod compact;
 pub mod modes;
 
 use std::sync::Arc;

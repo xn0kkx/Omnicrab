@@ -77,6 +77,52 @@ fn apply_env(c: &mut Command, a: &Account) {
     }
 }
 
+/// Models a CLI can be asked for. Only `agy` can list them; the others get a static list.
+pub async fn list_models(a: &Account) -> Result<Vec<String>, ProviderError> {
+    match a.kind {
+        ProviderKind::AgyCli => {
+            let mut c = Command::new(binary(a)?);
+            c.arg("models")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .current_dir(std::env::temp_dir());
+            apply_env(&mut c, a);
+            let out = tokio::time::timeout(std::time::Duration::from_secs(15), c.output())
+                .await
+                .map_err(|_| ProviderError::new("`agy models` timed out", true))?
+                .map_err(|e| ProviderError::new(format!("cannot start `agy`: {e}"), true))?;
+            Ok(parse_agy_models(&String::from_utf8_lossy(&out.stdout)))
+        }
+        ProviderKind::ClaudeCli => Ok([
+            "fable",
+            "opus",
+            "sonnet",
+            "haiku",
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ]
+        .map(String::from)
+        .to_vec()),
+        ProviderKind::CodexCli => Ok(["gpt-5", "gpt-5-codex", "o3"].map(String::from).to_vec()),
+        _ => Ok(["gemini-2.5-pro", "gemini-2.5-flash"]
+            .map(String::from)
+            .to_vec()),
+    }
+}
+
+/// `agy models` prints `id<TAB>Label` lines after a "Fetching..." banner.
+fn parse_agy_models(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(id, _)| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
 /// Interactive sign-in command for the account (inherits the terminal).
 pub fn login_command(a: &Account) -> Result<std::process::Command, ProviderError> {
     if a.kind.login_args().is_empty() {
@@ -120,6 +166,9 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
             }
             if !model.is_empty() {
                 c.args(["--model", &model]);
+            }
+            if let Some(e) = a.effort.as_deref().filter(|e| !e.is_empty()) {
+                c.args(["--effort", e]);
             }
         }
         ProviderKind::CodexCli => {
@@ -508,6 +557,15 @@ pub async fn stream(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agy_models_listing() {
+        let out = "Fetching available models...\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\nclaude-opus-5-5-high\tClaude Opus 5.5 (High)\n";
+        assert_eq!(
+            super::parse_agy_models(out),
+            ["gemini-3.8-flash-low", "claude-opus-5-5-high"]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -524,6 +582,7 @@ mod tests {
             profile_dir: Some(dir.to_string_lossy().into_owned()),
             budget_usd_month: None,
             enabled: true,
+            effort: None,
         };
         let mut c = Command::new("claude");
         apply_env(&mut c, &a);
