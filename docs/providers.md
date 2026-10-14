@@ -29,7 +29,7 @@ Anthropic's terms do not allow using Free/Pro/Max OAuth tokens in third-party ap
 
 | Kind | Command (simplified) |
 | --- | --- |
-| Claude Code | `claude -p <prompt> --output-format stream-json --verbose --include-partial-messages --no-session-persistence --strict-mcp-config --tools ""` |
+| Claude Code | `claude -p <prompt> --output-format stream-json --verbose --include-partial-messages --no-session-persistence --strict-mcp-config --tools "WebSearch,WebFetch" --allowedTools "WebSearch WebFetch"` |
 | Codex | `codex exec --json --skip-git-repo-check --sandbox read-only <prompt>` |
 | Antigravity (`agy`) | `agy --output-format stream-json --mode plan --disable-slash-commands -p <prompt>` |
 | Gemini CLI | `gemini --output-format stream-json -p <prompt>` |
@@ -38,6 +38,7 @@ Details:
 
 - Log in once with the CLI itself (`claude`, `codex login`, `gemini`).
 - The subprocess runs in the system temp directory with tools disabled or read-only, so it cannot touch your projects.
+- Claude accounts get only the read-only web tools (`WebSearch`, `WebFetch`), so "search the web" requests work. With `--tools ""` the model would print a fake `<tool_use>` block and no answer. Tool calls show up as a dim note (`web search: ...`) above the answer.
 - Multi-turn history is flattened into one prompt because these CLIs are single-shot.
 - `--strict-mcp-config` stops the CLI from loading the MCP servers of your global config, which otherwise adds ~20k input tokens (about 5× the cost) to every request.
 - Token counts and (for Claude) `total_cost_usd` come from the CLI's final JSON event.

@@ -24,6 +24,7 @@ pub enum RunEvent {
         account: String,
     },
     Delta(String),
+    Note(String),
     Failover {
         from: String,
         reason: String,
@@ -103,6 +104,7 @@ impl Core {
                         text.push_str(&d);
                         send(RunEvent::Delta(d));
                     }
+                    ProviderEvent::Note(n) => send(RunEvent::Note(n)),
                     ProviderEvent::Done { usage, model } => outcome = Some(Ok((usage, model))),
                     ProviderEvent::Error(e) => outcome = Some(Err(e)),
                 }

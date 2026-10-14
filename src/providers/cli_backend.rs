@@ -111,7 +111,9 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
                 "--no-session-persistence",
                 "--strict-mcp-config",
                 "--tools",
-                "",
+                "WebSearch,WebFetch",
+                "--allowedTools",
+                "WebSearch WebFetch",
             ]);
             if let Some(s) = &req.system {
                 c.args(["--append-system-prompt", s]);
@@ -196,10 +198,21 @@ struct Parsed {
     usage: Option<TokenUsage>,
     error: Option<String>,
     model: Option<String>,
+    /// Tool activity, e.g. "web search: query".
+    note: Option<String>,
 }
 
 fn u(v: &Value, k: &str) -> u64 {
     v.get(k).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn tool_note(b: &Value) -> String {
+    let i = &b["input"];
+    match b["name"].as_str().unwrap_or("tool") {
+        "WebSearch" => format!("web search: {}", i["query"].as_str().unwrap_or("")),
+        "WebFetch" => format!("fetch: {}", i["url"].as_str().unwrap_or("")),
+        n => n.to_string(),
+    }
 }
 
 fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
@@ -217,10 +230,15 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
                 }
             }
             "assistant" => {
-                let text: String = v["message"]["content"]
-                    .as_array()
+                let blocks = v["message"]["content"].as_array();
+                let text: String = blocks
                     .map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect())
                     .unwrap_or_default();
+                p.note = blocks
+                    .into_iter()
+                    .flatten()
+                    .find(|b| b["type"] == "tool_use")
+                    .map(tool_note);
                 if !text.is_empty() {
                     p.full = Some(text);
                 }
@@ -362,6 +380,7 @@ pub async fn stream(
 
     let mut lines = BufReader::new(stdout).lines();
     let (mut streamed, mut last_full) = (false, None::<String>);
+    let mut after_tool = false;
     let (mut usage, mut model, mut error) = (None::<TokenUsage>, None::<String>, None::<String>);
     loop {
         let line = tokio::select! {
@@ -370,12 +389,22 @@ pub async fn stream(
         };
         let Ok(Some(line)) = line else { break };
         let p = parse_line(account.kind, &line);
+        if let Some(n) = p.note {
+            let _ = tx.send(ProviderEvent::Note(n)).await;
+            if streamed {
+                after_tool = true;
+            }
+        }
         if let Some(mut d) = p.delta {
             if account.kind == ProviderKind::AgyCli && !streamed {
                 d = strip_agy_tag(&d).to_string();
             }
             if d.is_empty() {
                 continue;
+            }
+            if after_tool {
+                after_tool = false;
+                let _ = tx.send(ProviderEvent::Delta("\n\n".into())).await;
             }
             streamed = true;
             if tx.send(ProviderEvent::Delta(d)).await.is_err() {
@@ -481,6 +510,16 @@ mod tests {
             (u.input, u.output, u.reported_cost_usd),
             (10, 5, Some(0.0123))
         );
+    }
+
+    #[test]
+    fn claude_tool_use_becomes_note() {
+        let p = parse_line(
+            ProviderKind::ClaudeCli,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"WebSearch","input":{"query":"dalai lama"}}]}}"#,
+        );
+        assert_eq!(p.note.as_deref(), Some("web search: dalai lama"));
+        assert!(p.full.is_none());
     }
 
     #[test]

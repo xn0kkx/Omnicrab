@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::mpsc;
@@ -188,6 +191,17 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit"),
 ];
 
+fn init_terminal() -> ratatui::DefaultTerminal {
+    let t = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    t
+}
+
+fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+}
+
 impl App {
     pub async fn new(
         store: Store,
@@ -248,7 +262,7 @@ impl App {
         mut rx: mpsc::UnboundedReceiver<Msg>,
         mut lane_rx: mpsc::UnboundedReceiver<(LaneId, RunEvent)>,
     ) -> Result<()> {
-        let mut terminal = ratatui::init();
+        let mut terminal = init_terminal();
         let mut events = EventStream::new();
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(150));
         let result: Result<()> = async {
@@ -260,9 +274,9 @@ impl App {
                             self.on_key(k);
                             if let Some((mut cmd, acct)) = self.pending_login.take() {
                                 drop(events);
-                                ratatui::restore();
+                                restore_terminal();
                                 let status = cmd.status();
-                                terminal = ratatui::init();
+                                terminal = init_terminal();
                                 events = EventStream::new();
                                 self.notice = Some(match status {
                                     Ok(s) if s.success() => {
@@ -274,6 +288,15 @@ impl App {
                                 });
                             }
                         }
+                        Some(Ok(Event::Mouse(m))) => match m.kind {
+                            MouseEventKind::ScrollUp => {
+                                self.scroll_up = self.scroll_up.saturating_add(3)
+                            }
+                            MouseEventKind::ScrollDown => {
+                                self.scroll_up = self.scroll_up.saturating_sub(3)
+                            }
+                            _ => {}
+                        },
                         Some(Err(e)) => return Err(e.into()),
                         None => break,
                         _ => {}
@@ -286,7 +309,7 @@ impl App {
             Ok(())
         }
         .await;
-        ratatui::restore();
+        restore_terminal();
         result
     }
 
@@ -392,6 +415,7 @@ impl App {
                 e.streaming = true;
             }
             RunEvent::Delta(d) => e.text.push_str(&d),
+            RunEvent::Note(n) => e.notes.push(n),
             RunEvent::Failover { from, reason } => e.notes.push(format!(
                 "failover: {from} - {}",
                 reason.lines().next().unwrap_or("")
@@ -466,7 +490,14 @@ impl App {
 
     // ------------------------------------------------------------------ keys
 
-    fn on_key(&mut self, k: KeyEvent) {
+    fn on_key(&mut self, mut k: KeyEvent) {
+        // Many terminals send ^H (0x08) or ^? for Backspace; crossterm reports those as Ctrl+char.
+        if k.modifiers == KeyModifiers::CONTROL
+            && matches!(k.code, KeyCode::Char('h') | KeyCode::Char('?'))
+        {
+            k.code = KeyCode::Backspace;
+            k.modifiers = KeyModifiers::NONE;
+        }
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             if self.active_runs > 0 {
                 self.cancel_runs();

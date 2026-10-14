@@ -35,6 +35,8 @@ pub struct TokenUsage {
 #[derive(Clone, Debug)]
 pub enum ProviderEvent {
     Delta(String),
+    /// Tool activity (e.g. a web search); shown as a note, not as answer text.
+    Note(String),
     Done { usage: TokenUsage, model: String },
     Error(ProviderError),
 }
@@ -122,6 +124,7 @@ pub async fn complete(
             ProviderEvent::Delta(d) => text.push_str(&d),
             ProviderEvent::Done { usage, model } => out = Some(Ok((usage, model))),
             ProviderEvent::Error(e) => out = Some(Err(e)),
+            ProviderEvent::Note(_) => {}
         }
     }
     let _ = h.await;

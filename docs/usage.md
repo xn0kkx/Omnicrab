@@ -57,7 +57,7 @@ Cost is computed from the [price table](providers.md#pricing); CLI accounts use 
 
 ## Chat
 
-- `Enter` sends, `Alt+Enter` (or `Ctrl+J`) inserts a newline, `Esc` clears the box or cancels running requests.
+- `Enter` sends, `Alt+Enter` (or `Ctrl+J`) inserts a newline, `Esc` clears the box or cancels running requests. `Ctrl+H` works as Backspace for terminals that send `^H`. The mouse wheel and `PageUp`/`PageDown` scroll the chat; hold `Shift` while dragging to select text (mouse capture is on).
 - Typing `/` or `@` opens a completion popup; `Tab` completes.
 - The status bar shows the active target, model override, session tokens/cost and a spinner while requests run.
 
