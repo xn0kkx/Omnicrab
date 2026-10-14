@@ -183,5 +183,13 @@ mod tests {
             "http://localhost:11434/"
         );
         assert!(endpoint_for(&acct(ProviderKind::Anthropic, None)).is_none());
+        assert_eq!(
+            endpoint_for(&acct(
+                ProviderKind::Anthropic,
+                Some("https://gw.example/claude/v1")
+            ))
+            .unwrap(),
+            "https://gw.example/claude/v1/"
+        );
     }
 }

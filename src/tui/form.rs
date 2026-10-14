@@ -129,10 +129,14 @@ impl Form {
         let kind = K::ALL[self.choice_idx(FieldId::Provider)];
         match f.id {
             FieldId::ApiKey => kind.needs_api_key(),
-            FieldId::BaseUrl => kind.is_local(),
+            FieldId::BaseUrl => !kind.is_cli(),
             FieldId::CliPath => kind.is_cli(),
             FieldId::ProfileDir => kind.profile_env().is_some(),
-            FieldId::Model => true,
+            // API accounts are created without a model; it is chosen when editing,
+            // once the account exists and can list its models.
+            FieldId::Model => {
+                kind.is_cli() || matches!(self.kind, FormKind::Account { edit: Some(_) })
+            }
             _ => true,
         }
     }

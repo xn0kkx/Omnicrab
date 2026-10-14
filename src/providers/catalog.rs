@@ -33,6 +33,8 @@ pub async fn list_models(a: &Account) -> Result<Vec<String>, ProviderError> {
             }
             ProviderKind::OpenAiCompat => openai_compat(a).await,
             k if k.is_cli() => cli_backend::list_models(a).await,
+            // A gateway lists its own models; genai only knows the official ones.
+            _ if a.base_url.is_some() => openai_compat(a).await,
             _ => {
                 let client = genai_backend::build_client(a);
                 let auth = genai::resolver::AuthData::from_single(
@@ -62,7 +64,11 @@ async fn openai_compat(a: &Account) -> Result<Vec<String>, ProviderError> {
     let client = reqwest::Client::new();
     let mut req = client.get(format!("{}/models", base.trim_end_matches('/')));
     if let Some(k) = secret_str(&a.api_key) {
-        req = req.bearer_auth(k);
+        // Bearer for OpenAI-style servers, x-api-key for Anthropic-style gateways.
+        req = req
+            .bearer_auth(k)
+            .header("x-api-key", k)
+            .header("anthropic-version", "2023-06-01");
     }
     let list: OpenAiList = req
         .send()

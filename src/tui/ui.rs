@@ -12,6 +12,7 @@ use ratatui::widgets::{
 use super::app::*;
 use super::crab;
 use super::form::{Form, FormKind};
+use super::questions::QuestionsState;
 use crate::model::*;
 use crate::usage::Window;
 
@@ -160,6 +161,7 @@ fn draw_main(f: &mut Frame, app: &App) {
                 draw_plan(f, pr)
             }
         }
+        Some(Modal::Questions(qs)) => draw_questions(f, qs, app.tick),
         None => {}
     }
 }
@@ -201,6 +203,21 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if let Some(m) = &app.model_override {
         spans.push(Span::raw(format!(" model={m}")));
     }
+    if let Some(w) = &app.workspace {
+        let name = w.file_name().map(|n| n.to_string_lossy().into_owned());
+        spans.push(Span::styled(
+            format!(
+                " {} {}",
+                if app.read_only { "ro" } else { "rw" },
+                name.as_deref().unwrap_or("/")
+            ),
+            Style::new().fg(if app.read_only {
+                Color::Green
+            } else {
+                Color::Yellow
+            }),
+        ));
+    }
     spans.push(Span::styled(
         format!(
             "  session: {} tok  ${:.4}",
@@ -209,8 +226,23 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         DIM,
     ));
     if app.active_runs > 0 {
+        let count = |st| app.entries.iter().filter(|e| e.state == st).count();
+        let (running, queued) = (count(LaneState::Running), count(LaneState::Queued));
+        let since = app
+            .entries
+            .iter()
+            .filter(|e| matches!(e.state, LaneState::Running))
+            .filter_map(|e| e.started)
+            .min()
+            .map(|s| format!(" · {}", fmt_secs((app.now - s).num_seconds())))
+            .unwrap_or_default();
+        let lanes = if running + queued > 1 {
+            format!(" · {running} running, {queued} queued")
+        } else {
+            String::new()
+        };
         spans.push(Span::styled(
-            format!("  {spinner} working (Esc to cancel)"),
+            format!("  {spinner} working{lanes}{since} (Esc to cancel)"),
             Style::new().fg(Color::Cyan),
         ));
     }
@@ -224,6 +256,17 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------- chat
+
+/// Most notes (tool activity, failovers) shown per lane.
+const MAX_NOTES: usize = 6;
+
+fn fmt_secs(s: i64) -> String {
+    if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
 
 fn wrapped_height(text: &str, width: usize) -> usize {
     let w = width.max(1);
@@ -249,7 +292,32 @@ fn draw_crab(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
-    let in_lines = app.input.as_str().split('\n').count().clamp(1, 6) as u16;
+    // The message box grows with its content (wrapped rows, not just lines) up to
+    // a cap and scrolls to keep the cursor visible, like Claude Code's prompt.
+    let cursor = if app.tick % 6 < 3 { "▏" } else { " " };
+    let box_w = (area.width.saturating_sub(2) as usize).max(1);
+    let (cur_line, cur_col) = app.input.line_col();
+    let mut rows: Vec<Line> = vec![];
+    let mut cursor_row = 0usize;
+    for (i, l) in app.input.as_str().split('\n').enumerate() {
+        let text: Vec<char> = if i == cur_line {
+            let mut c: Vec<char> = l.chars().collect();
+            let at = cur_col.min(c.len());
+            c.splice(at..at, cursor.chars());
+            cursor_row = rows.len() + at / box_w;
+            c
+        } else {
+            l.chars().collect()
+        };
+        if text.is_empty() {
+            rows.push(Line::raw(""));
+        }
+        for chunk in text.chunks(box_w) {
+            rows.push(Line::raw(chunk.iter().collect::<String>()));
+        }
+    }
+    let max_rows = (area.height.saturating_sub(8) as usize).clamp(1, 10);
+    let in_lines = rows.len().clamp(1, max_rows) as u16;
     // The crab needs its own strip; skip it on short terminals.
     let crab_h = if area.height >= 18 {
         crab::HEIGHT as u16
@@ -290,18 +358,68 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             ),
         };
         let mut head = vec![Span::styled(label, name_style)];
+        if let Some(l) = &e.label {
+            head.push(Span::styled(
+                format!(" [{l}]"),
+                Style::new().fg(Color::Magenta),
+            ));
+        }
         if e.streaming {
             head.push(Span::styled(" ▍", Style::new().fg(Color::Cyan)));
         }
-        for n in &e.notes {
-            head.push(Span::styled(
-                format!("  {n}"),
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM),
-            ));
+        let state = match e.state {
+            LaneState::Queued => Some(("queued".to_string(), DIM)),
+            LaneState::Running => Some((
+                format!(
+                    "running {}",
+                    fmt_secs(e.started.map(|s| (app.now - s).num_seconds()).unwrap_or(0))
+                ),
+                Style::new().fg(Color::Cyan),
+            )),
+            LaneState::Done => e.took_secs.map(|s| {
+                (
+                    format!("done {}", fmt_secs(s)),
+                    Style::new().fg(Color::Green),
+                )
+            }),
+            LaneState::Failed => e.took_secs.map(|s| {
+                (
+                    format!("failed {}", fmt_secs(s)),
+                    Style::new().fg(Color::Red),
+                )
+            }),
+            LaneState::Idle => None,
+        };
+        if let Some((t, st)) = state {
+            head.push(Span::styled(format!(" · {t}"), st));
         }
         lines.push(Line::from(head));
-        for l in e.text.split('\n') {
-            lines.push(Line::raw(l.to_string()));
+        let note_style = Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM);
+        let hidden = e.notes.len().saturating_sub(MAX_NOTES);
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ↳ +{hidden} earlier"),
+                note_style,
+            )));
+        }
+        for n in &e.notes[hidden..] {
+            lines.push(Line::from(Span::styled(format!("  ↳ {n}"), note_style)));
+        }
+        if e.state == LaneState::Queued {
+            if let Some(t) = &e.task {
+                lines.push(Line::from(Span::styled(format!("  {t}"), DIM)));
+            }
+        } else if e.text.is_empty() && e.state == LaneState::Running {
+            let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            lines.push(Line::from(Span::styled(
+                format!("  {} thinking…", spin[(app.tick as usize) % spin.len()]),
+                DIM,
+            )));
+        }
+        if !e.text.is_empty() {
+            for l in e.text.split('\n') {
+                lines.push(Line::raw(l.to_string()));
+            }
         }
         if !e.meta.is_empty() {
             lines.push(Line::from(Span::styled(e.meta.clone(), DIM)));
@@ -333,30 +451,14 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         msgs,
     );
 
-    let cursor = if app.tick % 6 < 3 { "▏" } else { " " };
-    let (cur_line, cur_col) = app.input.line_col();
-    let shown: Vec<Line> = {
-        let v: Vec<Line> = app
-            .input
-            .as_str()
-            .split('\n')
-            .enumerate()
-            .map(|(i, l)| {
-                if i == cur_line {
-                    let before: String = l.chars().take(cur_col).collect();
-                    let after: String = l.chars().skip(cur_col).collect();
-                    Line::from(vec![Span::raw(before), Span::raw(cursor), Span::raw(after)])
-                } else {
-                    Line::raw(l.to_string())
-                }
-            })
-            .collect();
-        // Keep the line with the cursor in the 6-line window.
-        let skip = (cur_line + 1).saturating_sub(6);
-        v.into_iter().skip(skip).take(6).collect()
-    };
+    let skip = (cursor_row + 1).saturating_sub(in_lines as usize);
+    let shown: Vec<Line> = rows
+        .into_iter()
+        .skip(skip)
+        .take(in_lines as usize)
+        .collect();
     f.render_widget(
-        Paragraph::new(shown).wrap(Wrap { trim: false }).block(
+        Paragraph::new(shown).block(
             Block::bordered()
                 .title(" message (Enter send · Alt+Enter newline) ")
                 .border_style(Style::new().fg(ACCENT)),
@@ -1169,11 +1271,19 @@ fn draw_plan(f: &mut Frame, pr: &PlanReview) {
         } else {
             Style::new()
         };
-        let who = if s.agent.is_empty() {
-            "executor pool".to_string()
-        } else {
-            format!("@{}", s.agent)
-        };
+        let who = format!(
+            "{} · {}",
+            if s.agent.is_empty() {
+                "executor pool".to_string()
+            } else {
+                format!("@{}", s.agent)
+            },
+            if s.access() == Access::Read {
+                "read"
+            } else {
+                "write"
+            }
+        );
         lines.push(Line::from(vec![
             Span::styled(if i == pr.sel { "▶ " } else { "  " }, hi),
             Span::styled(
@@ -1193,6 +1303,97 @@ fn draw_plan(f: &mut Frame, pr: &PlanReview) {
                         " Enter approve · e edit · d remove · r revise · ↑↓ · Esc discard "
                             .fg(Color::DarkGray),
                     ))
+                    .border_style(Style::new().fg(Color::Cyan)),
+            )
+            .wrap(Wrap { trim: false }),
+        a,
+    );
+}
+
+fn draw_questions(f: &mut Frame, qs: &QuestionsState, tick: u64) {
+    let q = &qs.questions[qs.tab];
+    let opts_h: usize = q
+        .options
+        .iter()
+        .map(|o| if o.description.is_empty() { 1 } else { 2 })
+        .sum::<usize>()
+        + 1;
+    let a = centered(f.area(), 90, (opts_h as u16 + 8).min(f.area().height));
+    f.render_widget(Clear, a);
+
+    // Tabs: one chip per question, ✓ once answered.
+    let mut tabs: Vec<Span> = vec![];
+    for (i, qu) in qs.questions.iter().enumerate() {
+        let mark = if qs.answered(i) { "✓" } else { " " };
+        let st = if i == qs.tab {
+            Style::new().fg(Color::Black).bg(Color::Cyan).bold()
+        } else if qs.answered(i) {
+            Style::new().fg(Color::Green)
+        } else {
+            DIM
+        };
+        tabs.push(Span::styled(format!(" {mark} {} ", qu.header), st));
+        tabs.push(Span::raw(" "));
+    }
+    let mut lines = vec![
+        Line::from(tabs),
+        Line::raw(""),
+        Line::from(Span::styled(q.question.clone(), Style::new().bold())),
+        Line::raw(""),
+    ];
+    let cursor = if tick % 6 < 3 { "▏" } else { " " };
+    for row in 0..qs.rows(qs.tab) {
+        let here = qs.cursor[qs.tab] == row;
+        let on = qs.picked[qs.tab][row];
+        let mark = match (q.multi, on) {
+            (true, true) => "[x]",
+            (true, false) => "[ ]",
+            (false, true) => "(●)",
+            (false, false) => "( )",
+        };
+        // Reverse video stays visible on any terminal theme.
+        let hi = match (here, on) {
+            (true, _) => Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            (false, true) => Style::new().fg(Color::Green).bold(),
+            (false, false) => Style::new(),
+        };
+        let label = if qs.is_other(qs.tab, row) {
+            let text = qs.other[qs.tab].as_str();
+            if qs.typing {
+                format!("Other: {text}{cursor}")
+            } else if text.is_empty() {
+                "Other: type your own answer".to_string()
+            } else {
+                format!("Other: {text}")
+            }
+        } else {
+            q.options[row].label.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if here { "▶ " } else { "  " }, hi),
+            Span::styled(format!("{} ", row + 1), DIM),
+            Span::styled(format!("{mark} {label}"), hi),
+        ]));
+        if let Some(o) = q.options.get(row).filter(|o| !o.description.is_empty()) {
+            lines.push(Line::from(Span::styled(
+                format!("        {}", o.description),
+                DIM,
+            )));
+        }
+    }
+    let hint = if qs.typing {
+        " type your answer · Enter confirm · ↑↓ leave field · Esc back "
+    } else if q.multi {
+        " ↑↓ move · Space mark · Enter next/submit · ←→ question · Esc skip "
+    } else {
+        " ↑↓ move · Space select · Enter next/submit · ←→ question · Esc skip "
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .title(" Questions ")
+                    .title_bottom(Line::from(hint.fg(Color::DarkGray)))
                     .border_style(Style::new().fg(Color::Cyan)),
             )
             .wrap(Wrap { trim: false }),

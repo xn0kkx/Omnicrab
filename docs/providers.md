@@ -14,6 +14,10 @@ Handled by the [`genai`](https://crates.io/crates/genai) crate. A fresh client i
 
 Default model names are suggestions and can be edited in the account form.
 
+### Gateways and custom endpoints
+
+Every API-key account has an optional **Base URL**. Leave it empty for the official endpoint, or point it at an Anthropic-/OpenAI-compatible gateway or reseller. The URL must include the API version prefix, for example `https://host:8443/claude/v1` for an Anthropic gateway (the client appends `messages`). The key is stored encrypted like any other. Gateway model IDs may differ from the official ones (for example `claude-haiku-5.5`), so add matching `[prices."<model>"]` entries to `config.toml` if you want cost figures.
+
 ## Local models
 
 | Kind | Default URL | Notes |
@@ -37,13 +41,16 @@ Anthropic's terms do not allow using Free/Pro/Max OAuth tokens in third-party ap
 Details:
 
 - Log in once with the CLI itself (`claude`, `codex login`, `gemini`).
-- The subprocess runs in the system temp directory with tools disabled or read-only, so it cannot touch your projects.
-- Claude accounts get only the read-only web tools (`WebSearch`, `WebFetch`), so "search the web" requests work. With `--tools ""` the model would print a fake `<tool_use>` block and no answer. Tool calls show up as a dim note (`web search: ...`) above the answer.
+- The subprocess runs in the **workspace** (the folder omnicrab was opened in, see [usage](usage.md#project-folder-and-access)); without a usable workspace it runs in the system temp directory with web tools only.
+- Access by role: `Read` (planner, chat) or `Write` (executors, unless `--read-only`). Claude gets `--tools Read,Grep,Glob,WebSearch,WebFetch`, plus `Edit,Write,Bash` and `--permission-mode acceptEdits` for `Write`, always with `--add-dir <workspace>`. `agy` uses `--mode plan` / `--mode accept-edits` with `--add-dir`. Codex uses `-C <workspace> --sandbox read-only|workspace-write`. Gemini uses `--include-directories` and, for `Write`, `--approval-mode auto_edit`. The Codex and Gemini flags follow their documentation and are covered by unit tests only.
+- Claude must always keep some tool: with `--tools ""` the model would print a fake `<tool_use>` block and no answer. Tool calls show up as dim `↳` notes (`read: src/a.rs`, `$ cargo test`, `web search: ...`) under the lane header.
 - Multi-turn history is flattened into one prompt because these CLIs are single-shot.
 - `--strict-mcp-config` stops the CLI from loading the MCP servers of your global config, which otherwise adds ~20k input tokens (about 5× the cost) to every request.
 - Token counts and (for Claude) `total_cost_usd` come from the CLI's final JSON event.
 - A custom binary path can be set per account.
 - **Antigravity (`agy`)**: runs with `--mode plan` so the agent stays read-only and nothing is auto-approved. Plan mode prefixes answers with a marker like `[MAHI68]`, which omnicrab strips. `agy` reports tokens but no cost, and its model name is not part of the output, so cost shows `$0` unless you set the account's **Model** (for example `claude-sonnet-5-5-medium`, see `agy models`) and the price table has a matching prefix. Its built-in context is large (~17k input tokens per request).
+- `--json-schema` is used for the lead's JSON turns (Claude and agy). Claude delivers the answer as a `StructuredOutput` tool call, agy as `structured_output`; both are parsed into plain text. Codex and Gemini get the schema in the prompt only.
+- Each Claude call loads your global `~/.claude` settings (instructions, hooks, skills), which can add tens of thousands of input tokens per call; the lead loop makes several calls, so prefer cheap models for scouts and workers.
 - Output formats change between CLI versions. Parsers ignore unknown events; if a CLI starts failing, check the log and `omnicrab doctor`.
 
 Check the current terms of each vendor before relying on this for automation.

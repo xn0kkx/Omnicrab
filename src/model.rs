@@ -4,6 +4,22 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// What a CLI agent may do inside the project directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// Read files and search; nothing is changed.
+    Read,
+    /// Read, edit files and run commands.
+    Write,
+}
+
+/// The project directory CLI agents work in (otherwise they run in a temp dir).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Workspace {
+    pub root: std::path::PathBuf,
+    pub access: Access,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {

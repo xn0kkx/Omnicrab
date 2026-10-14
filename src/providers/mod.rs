@@ -23,6 +23,13 @@ pub struct ChatRequest {
     pub turns: Vec<ChatTurn>,
     /// Overrides the account's default model.
     pub model: Option<String>,
+    /// The caller only captures the text (planner, executor, synthesis): when a provider
+    /// fails after streaming part of it, discard the partial text and try the next account.
+    pub restart_on_partial: bool,
+    /// Project directory for CLI agents; `None` = temp dir, web tools only.
+    pub workspace: Option<crate::model::Workspace>,
+    /// JSON schema the answer must follow (Claude and agy enforce it; others rely on the prompt).
+    pub json_schema: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -40,6 +47,8 @@ pub enum ProviderEvent {
     Delta(String),
     /// Tool activity (e.g. a web search); shown as a note, not as answer text.
     Note(String),
+    /// The provider started over (e.g. an internal retry): drop the text streamed so far.
+    Reset,
     Done {
         usage: TokenUsage,
         model: String,
@@ -92,6 +101,10 @@ impl ProviderError {
             "dns",
             "network",
             "cannot start",
+            "content safety",
+            "blocked by",
+            "retries exhausted",
+            "safety filter",
         ]
         .iter()
         .any(|k| m.contains(k));
@@ -130,6 +143,7 @@ pub async fn complete(
             ProviderEvent::Delta(d) => text.push_str(&d),
             ProviderEvent::Done { usage, model } => out = Some(Ok((usage, model))),
             ProviderEvent::Error(e) => out = Some(Err(e)),
+            ProviderEvent::Reset => text.clear(),
             ProviderEvent::Note(_) => {}
         }
     }
@@ -143,13 +157,22 @@ pub async fn complete(
 
 /// Connectivity check: 1-token style ping. Returns the model name that answered.
 pub async fn test_connection(account: &Account) -> Result<String, ProviderError> {
+    // An account created without a model is tested with one the endpoint lists itself.
+    let model = if account.model.is_empty() && !account.kind.is_cli() {
+        Some(probe_model(account).await?)
+    } else {
+        None
+    };
     let req = ChatRequest {
         system: None,
         turns: vec![ChatTurn {
             role: Role::User,
             content: "Reply with the single word: ok".into(),
         }],
-        model: None,
+        model,
+        restart_on_partial: false,
+        workspace: None,
+        json_schema: None,
     };
     let fut = complete(account, req, CancellationToken::new());
     match tokio::time::timeout(std::time::Duration::from_secs(60), fut).await {
@@ -157,6 +180,50 @@ pub async fn test_connection(account: &Account) -> Result<String, ProviderError>
         Ok(Err(e)) => Err(e),
         Err(_) => Err(ProviderError::new("timed out", true)),
     }
+}
+
+/// Picks a model for the connection test from the endpoint's `GET <base>/models`,
+/// preferring a small one (`haiku`, `mini`, `flash`). Needs a custom Base URL.
+async fn probe_model(a: &Account) -> Result<String, ProviderError> {
+    let no_model = || {
+        ProviderError::new(
+            "no model set: edit the account (e) and choose one with Ctrl+O",
+            false,
+        )
+    };
+    let Some(base) = a.base_url.as_deref() else {
+        return Err(no_model());
+    };
+    #[derive(serde::Deserialize)]
+    struct List {
+        data: Vec<Item>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Item {
+        id: String,
+    }
+    let mut req = reqwest::Client::new()
+        .get(format!("{}/models", base.trim_end_matches('/')))
+        .header("anthropic-version", "2023-06-01")
+        .timeout(std::time::Duration::from_secs(15));
+    if let Some(k) = secret_str(&a.api_key) {
+        req = req.header("x-api-key", k).bearer_auth(k);
+    }
+    let list: List = req
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| ProviderError::classify(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| ProviderError::classify(e.to_string()))?;
+    let small = ["haiku", "mini", "flash"];
+    list.data
+        .iter()
+        .find(|m| small.iter().any(|s| m.id.to_lowercase().contains(s)))
+        .or(list.data.first())
+        .map(|m| m.id.clone())
+        .ok_or_else(no_model)
 }
 
 pub fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -180,5 +247,6 @@ mod tests {
         assert!(ProviderError::classify("Web stream error for model 'x'.\nCause: error sending request for url (http://localhost:8080/v1)").failover);
         assert!(ProviderError::classify("HTTP 429 Too Many Requests").failover);
         assert!(!ProviderError::classify("invalid request: messages must not be empty").failover);
+        assert!(ProviderError::classify("response was blocked by content safety filters").failover);
     }
 }

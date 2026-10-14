@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{ChatRequest, ProviderError, ProviderEvent, TokenUsage, which};
-use crate::model::{Account, LimitWindow, ProviderKind, RateLimits, Role};
+use crate::model::{Access, Account, LimitWindow, ProviderKind, RateLimits, Role};
 
 /// CLIs are single-prompt, so history is flattened into a transcript.
 fn flatten(req: &ChatRequest) -> String {
@@ -139,6 +139,7 @@ pub fn login_command(a: &Account) -> Result<std::process::Command, ProviderError
 
 fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
     let prompt = flatten(req);
+    let access = req.workspace.as_ref().map(|w| w.access);
     let model = req
         .model
         .clone()
@@ -157,10 +158,21 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
                 "--no-session-persistence",
                 "--strict-mcp-config",
                 "--tools",
-                "WebSearch,WebFetch",
+                claude_tools(access),
                 "--allowedTools",
-                "WebSearch WebFetch",
+                claude_allowed(access),
             ]);
+            if let Some(schema) = &req.json_schema {
+                c.args(["--json-schema", schema]);
+            }
+            if let Some(ws) = &req.workspace {
+                c.arg("--add-dir").arg(&ws.root);
+                if ws.access == Access::Write {
+                    c.args(["--permission-mode", "acceptEdits"]);
+                }
+                // The encrypted project state is not for agents to touch.
+                c.args(["--disallowedTools", "Edit(.omni/**) Write(.omni/**)"]);
+            }
             if let Some(s) = &req.system {
                 c.args(["--append-system-prompt", s]);
             }
@@ -176,13 +188,20 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
                 Some(s) => format!("{s}\n\n{prompt}"),
                 None => prompt,
             };
+            let sandbox = match access {
+                Some(Access::Write) => "workspace-write",
+                _ => "read-only",
+            };
             c.args([
                 "exec",
                 "--json",
                 "--skip-git-repo-check",
                 "--sandbox",
-                "read-only",
+                sandbox,
             ]);
+            if let Some(ws) = &req.workspace {
+                c.arg("-C").arg(&ws.root);
+            }
             if !model.is_empty() {
                 c.args(["-m", &model]);
             }
@@ -193,14 +212,24 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
                 Some(s) => format!("{s}\n\n{prompt}"),
                 None => prompt,
             };
-            // `--mode plan` keeps the agent read-only; it never gets auto-approved permissions.
+            // `--mode plan` keeps the agent read-only; only Write access lets it edit files.
+            let mode = match access {
+                Some(Access::Write) => "accept-edits",
+                _ => "plan",
+            };
             c.args([
                 "--output-format",
                 "stream-json",
                 "--mode",
-                "plan",
+                mode,
                 "--disable-slash-commands",
             ]);
+            if let Some(ws) = &req.workspace {
+                c.arg("--add-dir").arg(&ws.root);
+            }
+            if let Some(schema) = &req.json_schema {
+                c.args(["--json-schema", schema]);
+            }
             if !model.is_empty() {
                 c.args(["--model", &model]);
             }
@@ -212,6 +241,12 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
                 None => prompt,
             };
             c.args(["--output-format", "stream-json"]);
+            if let Some(ws) = &req.workspace {
+                c.arg("--include-directories").arg(&ws.root);
+                if ws.access == Access::Write {
+                    c.args(["--approval-mode", "auto_edit"]);
+                }
+            }
             if !model.is_empty() {
                 c.args(["-m", &model]);
             }
@@ -223,9 +258,28 @@ fn build_command(a: &Account, req: &ChatRequest, bin: &str) -> Command {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     apply_env(&mut c, a);
-    // Run in a neutral directory so the CLI doesn't pick up project context/tools.
-    c.current_dir(std::env::temp_dir());
+    // Without a workspace run in a neutral directory so the CLI doesn't pick up project context.
+    match &req.workspace {
+        Some(ws) => c.current_dir(&ws.root),
+        None => c.current_dir(std::env::temp_dir()),
+    };
     c
+}
+
+fn claude_tools(access: Option<Access>) -> &'static str {
+    match access {
+        None => "WebSearch,WebFetch",
+        Some(Access::Read) => "Read,Grep,Glob,WebSearch,WebFetch",
+        Some(Access::Write) => "Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch",
+    }
+}
+
+fn claude_allowed(access: Option<Access>) -> &'static str {
+    match access {
+        None => "WebSearch WebFetch",
+        Some(Access::Read) => "Read Grep Glob WebSearch WebFetch",
+        Some(Access::Write) => "Read Grep Glob Edit Write Bash WebSearch WebFetch",
+    }
 }
 
 /// In `--mode plan`, agy starts its answer with a `[MAHI68]`-style marker line.
@@ -239,6 +293,26 @@ fn strip_agy_tag(s: &str) -> &str {
     }
 }
 
+/// agy restarts its answer after an internal retry, marking it with a new `[TAG]`
+/// (upper-case letters and digits). Returns the text after the last such marker.
+fn agy_restart(s: &str) -> Option<&str> {
+    let mut found = None;
+    for (i, _) in s.match_indices('[') {
+        let rest = &s[i + 1..];
+        let Some(end) = rest.find(']') else { continue };
+        let tag = &rest[..end];
+        if (4..=12).contains(&tag.len())
+            && tag
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            && tag.chars().any(|c| c.is_ascii_digit())
+        {
+            found = Some(rest[end + 1..].trim_start_matches(['\n', ' ']));
+        }
+    }
+    found
+}
+
 #[derive(Default)]
 struct Parsed {
     delta: Option<String>,
@@ -248,7 +322,7 @@ struct Parsed {
     error: Option<String>,
     model: Option<String>,
     /// Tool activity, e.g. "web search: query".
-    note: Option<String>,
+    notes: Vec<String>,
     /// Subscription plan limits (Claude only).
     limits: Option<RateLimits>,
 }
@@ -290,13 +364,50 @@ fn parse_rate_limits(info: &Value) -> Option<RateLimits> {
     (!r.is_empty()).then_some(r)
 }
 
+/// One-line, length-capped version of a path or command for a note.
+fn short(s: &str) -> String {
+    let s = s.lines().next().unwrap_or("").trim();
+    if s.chars().count() > 80 {
+        format!("{}…", s.chars().take(79).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
 fn tool_note(b: &Value) -> String {
     let i = &b["input"];
+    let s = |k: &str| short(i[k].as_str().unwrap_or(""));
     match b["name"].as_str().unwrap_or("tool") {
-        "WebSearch" => format!("web search: {}", i["query"].as_str().unwrap_or("")),
-        "WebFetch" => format!("fetch: {}", i["url"].as_str().unwrap_or("")),
+        "WebSearch" => format!("web search: {}", s("query")),
+        "WebFetch" => format!("fetch: {}", s("url")),
+        "Read" => format!("read: {}", s("file_path")),
+        "Edit" | "MultiEdit" => format!("edit: {}", s("file_path")),
+        "Write" => format!("write: {}", s("file_path")),
+        "Bash" => format!("$ {}", s("command")),
+        "Grep" => format!("grep: {}", s("pattern")),
+        "Glob" => format!("glob: {}", s("pattern")),
         n => n.to_string(),
     }
+}
+
+/// Tool activity of an agy `step_update` (anything that is not the answer itself).
+/// Tools arrive as `{"step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{..}}}`.
+fn agy_step_note(st: &Value) -> Option<String> {
+    let ty = st["step_type"].as_str()?;
+    if st["state"] != "ACTIVE" || matches!(ty, "agent_response" | "user_input" | "finish") {
+        return None;
+    }
+    let name = st["tool_name"].as_str().unwrap_or(ty);
+    let target = st["tool_info"]["parameters"]
+        .as_object()
+        .and_then(|m| m.values().find_map(Value::as_str))
+        .map(short)
+        .unwrap_or_default();
+    Some(if target.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}: {target}")
+    })
 }
 
 fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
@@ -318,11 +429,17 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
                 let text: String = blocks
                     .map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect())
                     .unwrap_or_default();
-                p.note = blocks
-                    .into_iter()
-                    .flatten()
-                    .find(|b| b["type"] == "tool_use")
-                    .map(tool_note);
+                for b in blocks.into_iter().flatten() {
+                    if b["type"] != "tool_use" {
+                        continue;
+                    }
+                    // With `--json-schema` the answer arrives as the input of this pseudo tool.
+                    if b["name"] == "StructuredOutput" {
+                        p.full = Some(b["input"].to_string());
+                    } else {
+                        p.notes.push(tool_note(b));
+                    }
+                }
                 if !text.is_empty() {
                     p.full = Some(text);
                 }
@@ -355,6 +472,20 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
             "item.completed" if v["item"]["type"] == "agent_message" => {
                 p.full = v["item"]["text"].as_str().map(str::to_string);
             }
+            "item.started" => {
+                let it = &v["item"];
+                p.notes.extend(match it["type"].as_str() {
+                    Some("command_execution") => {
+                        Some(format!("$ {}", short(it["command"].as_str().unwrap_or(""))))
+                    }
+                    Some("file_change") => Some("editing files".to_string()),
+                    Some("web_search") => Some(format!(
+                        "web search: {}",
+                        short(it["query"].as_str().unwrap_or(""))
+                    )),
+                    _ => None,
+                });
+            }
             "turn.completed" => {
                 let us = &v["usage"];
                 p.usage = Some(TokenUsage {
@@ -380,12 +511,18 @@ fn parse_line(kind: ProviderKind, line: &str) -> Parsed {
                 let st = &v["step_update"];
                 if st["step_type"] == "agent_response" && st["state"] == "ACTIVE" {
                     p.delta = st["text_delta"].as_str().map(str::to_string);
+                } else {
+                    p.notes.extend(agy_step_note(st));
                 }
             }
             "result" => {
                 let r = &v["result"];
                 if r["status"] == "SUCCESS" {
-                    p.full = r["response"].as_str().map(str::to_string);
+                    // A schema-constrained answer comes ready parsed (the text has extra keys).
+                    p.full = match &r["structured_output"] {
+                        Value::Null => r["response"].as_str().map(str::to_string),
+                        so => Some(so.to_string()),
+                    };
                     p.usage = Some(TokenUsage {
                         input: u(&r["usage"], "input_tokens"),
                         output: u(&r["usage"], "output_tokens"),
@@ -470,6 +607,7 @@ pub async fn stream(
     let mut lines = BufReader::new(stdout).lines();
     let (mut streamed, mut last_full) = (false, None::<String>);
     let mut after_tool = false;
+    let mut last_note = None::<String>;
     let (mut usage, mut model, mut error) = (None::<TokenUsage>, None::<String>, None::<String>);
     let mut limits = RateLimits::default();
     loop {
@@ -479,15 +617,27 @@ pub async fn stream(
         };
         let Ok(Some(line)) = line else { break };
         let p = parse_line(account.kind, &line);
-        if let Some(n) = p.note {
+        for n in p.notes {
+            if last_note.as_deref() == Some(n.as_str()) {
+                continue;
+            }
+            last_note = Some(n.clone());
             let _ = tx.send(ProviderEvent::Note(n)).await;
             if streamed {
                 after_tool = true;
             }
         }
         if let Some(mut d) = p.delta {
-            if account.kind == ProviderKind::AgyCli && !streamed {
-                d = strip_agy_tag(&d).to_string();
+            if account.kind == ProviderKind::AgyCli {
+                if !streamed {
+                    d = strip_agy_tag(&d).to_string();
+                } else if req.json_schema.is_none()
+                    && let Some(rest) = agy_restart(&d)
+                {
+                    let rest = rest.to_string();
+                    let _ = tx.send(ProviderEvent::Reset).await;
+                    d = rest;
+                }
             }
             if d.is_empty() {
                 continue;
@@ -518,6 +668,12 @@ pub async fn stream(
     }
     let status = child.wait().await;
     let stderr_text = err_task.await.unwrap_or_default();
+    tracing::debug!(
+        account = %account.name,
+        status = ?status,
+        stderr = %stderr_text.trim().chars().take(2000).collect::<String>(),
+        "cli finished"
+    );
 
     if let Some(e) = error {
         return fail(ProviderError::classify(e)).await;
@@ -637,8 +793,107 @@ mod tests {
             ProviderKind::ClaudeCli,
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"WebSearch","input":{"query":"dalai lama"}}]}}"#,
         );
-        assert_eq!(p.note.as_deref(), Some("web search: dalai lama"));
+        assert_eq!(p.notes, ["web search: dalai lama"]);
         assert!(p.full.is_none());
+    }
+
+    #[test]
+    fn tool_notes_cover_files_and_shell() {
+        let note = |name: &str, input: &str| {
+            let line = format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"{name}","input":{input}}}]}}}}"#
+            );
+            parse_line(ProviderKind::ClaudeCli, &line).notes.remove(0)
+        };
+        assert_eq!(
+            note("Read", r#"{"file_path":"src/a.rs"}"#),
+            "read: src/a.rs"
+        );
+        assert_eq!(
+            note("Bash", r#"{"command":"cargo test\nmore"}"#),
+            "$ cargo test"
+        );
+        assert_eq!(note("Grep", r#"{"pattern":"fn main"}"#), "grep: fn main");
+        let c = parse_line(
+            ProviderKind::CodexCli,
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"ls"}}"#,
+        );
+        assert_eq!(c.notes, ["$ ls"]);
+    }
+
+    #[test]
+    fn claude_structured_output_is_the_answer() {
+        let p = parse_line(
+            ProviderKind::ClaudeCli,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"StructuredOutput","input":{"actions":[{"type":"finish","answer":"pong"}]}}]}}"#,
+        );
+        assert!(p.notes.is_empty(), "not shown as tool activity");
+        assert_eq!(
+            p.full.as_deref(),
+            Some(r#"{"actions":[{"answer":"pong","type":"finish"}]}"#)
+        );
+    }
+
+    #[test]
+    fn claude_notes_every_tool_use() {
+        let p = parse_line(
+            ProviderKind::ClaudeCli,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.rs"}},{"type":"tool_use","name":"Grep","input":{"pattern":"x"}}]}}"#,
+        );
+        assert_eq!(p.notes, ["read: a.rs", "grep: x"]);
+    }
+
+    #[test]
+    fn agy_tools_and_structured_result() {
+        let t = parse_line(
+            ProviderKind::AgyCli,
+            r#"{"event":"step_update","step_update":{"step_type":"tool","state":"ACTIVE","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"}}}}"#,
+        );
+        assert_eq!(t.notes, ["run_command: echo hi"]);
+        let done = parse_line(
+            ProviderKind::AgyCli,
+            r#"{"event":"step_update","step_update":{"step_type":"tool","state":"DONE","tool_name":"run_command"}}"#,
+        );
+        assert!(done.notes.is_empty());
+        let r = parse_line(
+            ProviderKind::AgyCli,
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"{\"x\":1,\"toolAction\":\"y\"}","structured_output":{"x":1},"usage":{}}}"#,
+        );
+        assert_eq!(r.full.as_deref(), Some(r#"{"x":1}"#));
+    }
+
+    #[test]
+    fn json_schema_reaches_claude_and_agy() {
+        let a = |kind| {
+            let acct = Account {
+                id: uuid::Uuid::nil(),
+                name: "t".into(),
+                kind,
+                api_key: None,
+                base_url: None,
+                model: String::new(),
+                cli_path: None,
+                profile_dir: None,
+                budget_usd_month: None,
+                enabled: true,
+                effort: None,
+            };
+            let req = ChatRequest {
+                turns: vec![super::super::ChatTurn {
+                    role: Role::User,
+                    content: "hi".into(),
+                }],
+                json_schema: Some("{}".into()),
+                ..Default::default()
+            };
+            build_command(&acct, &req, "bin")
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(has(&a(ProviderKind::ClaudeCli), "--json-schema", "{}"));
+        assert!(has(&a(ProviderKind::AgyCli), "--json-schema", "{}"));
     }
 
     #[test]
@@ -685,6 +940,94 @@ mod tests {
         assert_eq!(strip_agy_tag("[MAHI68] Tokio"), "Tokio");
         assert_eq!(strip_agy_tag("Tokio"), "Tokio");
         assert_eq!(strip_agy_tag("[note: x] keep"), "[note: x] keep");
+    }
+
+    #[test]
+    fn agy_restart_marker_mid_stream() {
+        assert_eq!(
+            agy_restart("aplicado[MAHI68] Nenhum repo"),
+            Some("Nenhum repo")
+        );
+        assert_eq!(agy_restart("see [docs] and [OK]"), None);
+        assert_eq!(agy_restart("plain"), None);
+    }
+
+    fn cmd_args(
+        kind: ProviderKind,
+        access: Option<Access>,
+    ) -> (Vec<String>, Option<std::path::PathBuf>) {
+        let a = Account {
+            id: uuid::Uuid::nil(),
+            name: "t".into(),
+            kind,
+            api_key: None,
+            base_url: None,
+            model: String::new(),
+            cli_path: None,
+            profile_dir: None,
+            budget_usd_month: None,
+            enabled: true,
+            effort: None,
+        };
+        let req = ChatRequest {
+            turns: vec![super::super::ChatTurn {
+                role: Role::User,
+                content: "hi".into(),
+            }],
+            workspace: access.map(|access| crate::model::Workspace {
+                root: "/proj".into(),
+                access,
+            }),
+            ..Default::default()
+        };
+        let c = build_command(&a, &req, "bin");
+        let c = c.as_std();
+        let args = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        (args, c.get_current_dir().map(|d| d.to_path_buf()))
+    }
+
+    fn has(args: &[String], a: &str, b: &str) -> bool {
+        args.windows(2).any(|w| w[0] == a && w[1] == b)
+    }
+
+    #[test]
+    fn workspace_access_maps_to_cli_flags() {
+        // No workspace: neutral dir, web tools only.
+        let (args, dir) = cmd_args(ProviderKind::ClaudeCli, None);
+        assert_eq!(dir, Some(std::env::temp_dir()));
+        assert!(has(&args, "--tools", "WebSearch,WebFetch"));
+        assert!(!args.iter().any(|a| a == "--add-dir"));
+
+        let (args, dir) = cmd_args(ProviderKind::ClaudeCli, Some(Access::Read));
+        assert_eq!(dir, Some("/proj".into()));
+        assert!(has(&args, "--tools", "Read,Grep,Glob,WebSearch,WebFetch"));
+        assert!(has(&args, "--add-dir", "/proj"));
+        assert!(!args.iter().any(|a| a == "--permission-mode"));
+
+        let (args, _) = cmd_args(ProviderKind::ClaudeCli, Some(Access::Write));
+        assert!(has(&args, "--permission-mode", "acceptEdits"));
+        assert!(args.iter().any(|a| a.contains("Bash")));
+        assert!(has(
+            &args,
+            "--disallowedTools",
+            "Edit(.omni/**) Write(.omni/**)"
+        ));
+
+        let (args, _) = cmd_args(ProviderKind::CodexCli, Some(Access::Write));
+        assert!(has(&args, "--sandbox", "workspace-write") && has(&args, "-C", "/proj"));
+        let (args, _) = cmd_args(ProviderKind::CodexCli, Some(Access::Read));
+        assert!(has(&args, "--sandbox", "read-only"));
+
+        let (args, _) = cmd_args(ProviderKind::AgyCli, Some(Access::Write));
+        assert!(has(&args, "--mode", "accept-edits") && has(&args, "--add-dir", "/proj"));
+        let (args, _) = cmd_args(ProviderKind::AgyCli, None);
+        assert!(has(&args, "--mode", "plan"));
+
+        let (args, _) = cmd_args(ProviderKind::GeminiCli, Some(Access::Write));
+        assert!(has(&args, "--approval-mode", "auto_edit"));
     }
 
     #[test]

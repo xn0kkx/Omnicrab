@@ -11,15 +11,21 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::form::{Field, FieldId, Form, FormKind};
 use super::input::InputBuf;
+use super::questions::{Origin, Outcome, QuestionsState};
+use crate::project::{ProjectAgent, ProjectCommand, ProjectDir};
+
+mod omni;
 use crate::crypto::{KdfParams, Vault, VaultHeader};
 use crate::model::*;
-use crate::orchestrator::{Core, LaneId, RunEvent, balance, compact, modes};
+use crate::orchestrator::{
+    Core, LaneId, Limits, RunEvent, balance, compact, lead, modes, questions,
+};
 use crate::providers::{self, ChatRequest, ChatTurn};
 use crate::store::Store;
 use crate::usage::{AccountUsage, PriceTable, Window, aggregate};
@@ -115,6 +121,8 @@ pub enum Modal {
     Picker(Picker),
     /// Review of `App::pending_plan`.
     Plan,
+    /// Multiple-choice questions from the planner or the chat model.
+    Questions(Box<QuestionsState>),
 }
 
 /// What happens with the value chosen in a [`Picker`].
@@ -155,12 +163,10 @@ impl Picker {
 
 /// A plan waiting for approval.
 pub struct PlanReview {
-    /// The user's original task.
-    pub task: String,
     pub steps: Vec<modes::Step>,
     pub sel: usize,
-    /// First lane of the block reserved for this run.
-    pub base: LaneId,
+    /// Answers the lead loop waiting for this decision.
+    pub reply: Option<oneshot::Sender<lead::Decision>>,
 }
 
 /// One selectable line of the Routing tab.
@@ -197,6 +203,17 @@ pub enum Target {
     Agent(Uuid),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LaneState {
+    /// Plain chat entries (messages, system notes).
+    #[default]
+    Idle,
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub role: Role,
@@ -206,6 +223,14 @@ pub struct Entry {
     pub meta: String,
     pub notes: Vec<String>,
     pub failed: bool,
+    /// Role in a multi-step run ("planner", "exec:x", "synthesis").
+    pub label: Option<String>,
+    pub state: LaneState,
+    /// First line of the task this lane works on (queued lanes show it).
+    pub task: Option<String>,
+    pub started: Option<chrono::DateTime<Utc>>,
+    /// Seconds the lane took, once it ended.
+    pub took_secs: Option<i64>,
 }
 
 impl Entry {
@@ -218,6 +243,11 @@ impl Entry {
             meta: String::new(),
             notes: vec![],
             failed: false,
+            label: None,
+            state: LaneState::Idle,
+            task: None,
+            started: None,
+            took_secs: None,
         }
     }
 }
@@ -231,11 +261,8 @@ pub enum Msg {
     SessionLoaded(Uuid, Vec<Message>),
     HeaderReady(Option<VaultHeader>),
     Models(Uuid, Result<Vec<String>, String>),
-    PlanReady {
-        task: String,
-        steps: Vec<modes::Step>,
-        base: LaneId,
-    },
+    /// The lead loop needs the user (questions, plan review).
+    Lead(lead::LeadMsg),
     Summary(compact::Summary),
     /// Result of `/compact`: the summary and how many messages it folded.
     Compacted(compact::Summary),
@@ -288,6 +315,20 @@ pub struct App {
     pub cancel: Option<CancellationToken>,
     pub tx: mpsc::UnboundedSender<Msg>,
     pub lane_tx: mpsc::UnboundedSender<(LaneId, RunEvent)>,
+    /// Project directory agents work in; `None` when none was usable.
+    pub workspace: Option<std::path::PathBuf>,
+    pub read_only: bool,
+    /// `--read-only` from the command line (the project's own setting can only add to it).
+    read_only_flag: bool,
+    /// `<workspace>/.omni`, once the vault is unlocked.
+    project: Option<ProjectDir>,
+    /// Decrypted instructions and memory, put in the prompts of every run.
+    project_context: Option<String>,
+    project_agent_defs: Vec<ProjectAgent>,
+    project_agent_ids: HashSet<Uuid>,
+    project_commands: Vec<ProjectCommand>,
+    /// Set by `/omni edit`; the run loop suspends the TUI and opens `$EDITOR`.
+    pending_edit: Option<omni::PendingEdit>,
     pub quit: bool,
     pub tick: u64,
     /// Wall clock sampled on every tick, so rendering stays a pure function of `App`.
@@ -298,6 +339,10 @@ pub struct App {
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show keys and commands"),
+    (
+        "/omni",
+        "/omni [init|edit <doc>|remember <note>] - encrypted project state in .omni",
+    ),
     ("/new", "start a new session"),
     ("/sessions", "open the sessions tab"),
     ("/usage", "open the usage tab"),
@@ -346,6 +391,8 @@ impl App {
     pub async fn new(
         store: Store,
         prices: PriceTable,
+        workspace: Result<std::path::PathBuf, String>,
+        read_only: bool,
     ) -> Result<(
         Self,
         mpsc::UnboundedReceiver<Msg>,
@@ -354,6 +401,10 @@ impl App {
         let header = store.vault_header().await?;
         let (tx, rx) = mpsc::unbounded_channel();
         let (lane_tx, lane_rx) = mpsc::unbounded_channel();
+        let (workspace, notice) = match workspace {
+            Ok(w) => (Some(w), None),
+            Err(e) => (None, Some(e)),
+        };
         let app = Self {
             store,
             prices: Arc::new(prices),
@@ -378,7 +429,7 @@ impl App {
             scroll_up: 0,
             sel: [0; 6],
             modal: None,
-            notice: None,
+            notice,
             target: None,
             model_override: None,
             routing: Routing::default(),
@@ -399,6 +450,15 @@ impl App {
             cancel: None,
             tx,
             lane_tx,
+            workspace,
+            read_only,
+            read_only_flag: read_only,
+            project: None,
+            project_context: None,
+            project_agent_defs: vec![],
+            project_agent_ids: HashSet::new(),
+            project_commands: vec![],
+            pending_edit: None,
             quit: false,
             tick: 0,
             now: Utc::now(),
@@ -422,6 +482,13 @@ impl App {
                     ev = events.next() => match ev {
                         Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
                             self.on_key(k);
+                            if self.pending_edit.is_some() {
+                                drop(events);
+                                restore_terminal();
+                                self.run_pending_edit();
+                                terminal = init_terminal();
+                                events = EventStream::new();
+                            }
                             if let Some((mut cmd, acct)) = self.pending_login.take() {
                                 drop(events);
                                 restore_terminal();
@@ -477,6 +544,8 @@ impl App {
                 self.active_runs = self.active_runs.saturating_sub(1);
                 if self.active_runs == 0 {
                     self.cancel = None;
+                    self.scan_chat_questions();
+                    self.save_session_copy();
                 }
                 self.reload();
             }
@@ -486,10 +555,12 @@ impl App {
                     store: self.store.clone(),
                     vault,
                     prices: self.prices.clone(),
+                    limits: Limits::from_env(),
                 });
                 self.screen = Screen::Main;
                 self.reload();
                 self.notice = Some("vault unlocked - press ? for help".into());
+                self.open_project();
             }
             Msg::Unlocked(Err(e)) => {
                 if let Screen::Unlock(u) = &mut self.screen {
@@ -503,6 +574,8 @@ impl App {
             Msg::Loaded(l) => {
                 self.accounts = l.accounts;
                 self.agents = l.agents;
+                self.project_agent_ids.clear();
+                self.merge_project_agents();
                 self.sessions = l.sessions;
                 self.usage = l.usage;
                 if !self.routing_ready {
@@ -556,15 +629,21 @@ impl App {
                         .insert(id, e.lines().next().unwrap_or("").to_string());
                 }
             },
-            Msg::PlanReady { task, steps, base } => {
+            Msg::Lead(lead::LeadMsg::Review { steps, reply }) => {
                 self.pending_plan = Some(PlanReview {
-                    task,
                     steps,
                     sel: 0,
-                    base,
+                    reply: Some(reply),
                 });
                 self.modal = Some(Modal::Plan);
                 self.notice = Some("review the plan: Enter approves, Esc discards".into());
+            }
+            Msg::Lead(lead::LeadMsg::Ask { questions, reply }) => {
+                self.modal = Some(Modal::Questions(Box::new(QuestionsState::new(
+                    questions,
+                    Origin::Lead(reply),
+                ))));
+                self.notice = Some("the lead asks you to choose (Esc skips)".into());
             }
             Msg::Summary(s) => self.summary = Some(s),
             Msg::Compacted(s) => {
@@ -598,7 +677,12 @@ impl App {
                                 "assistant".into()
                             }
                         });
-                        Entry::new(m.role, who, m.content)
+                        let text = if m.role == Role::Assistant {
+                            questions::extract_questions(&m.content).0
+                        } else {
+                            m.content
+                        };
+                        Entry::new(m.role, who, text)
                     })
                     .collect();
                 self.session_cost = 0.0;
@@ -611,18 +695,45 @@ impl App {
     }
 
     fn on_lane(&mut self, lane: LaneId, ev: RunEvent) {
-        if let RunEvent::Label(l) = &ev {
-            let idx = self.lane_entry(lane);
-            self.entries[idx].notes.insert(0, format!("[{l}]"));
-            return;
+        let now = self.now;
+        // These are not part of a lane: they get their own chat entry.
+        match ev {
+            RunEvent::Info { who, text } => {
+                self.entries.push(Entry::new(Role::System, who, text));
+                self.scroll_up = 0;
+            }
+            RunEvent::Final { account, text } => {
+                self.entries
+                    .push(Entry::new(Role::Assistant, account, text));
+                self.scroll_up = 0;
+            }
+            ev => self.on_lane_event(lane, ev, now),
         }
+    }
+
+    fn on_lane_event(&mut self, lane: LaneId, ev: RunEvent, now: chrono::DateTime<Utc>) {
         let idx = self.lane_entry(lane);
         let e = &mut self.entries[idx];
+        let end = |e: &mut Entry, st: LaneState| {
+            e.streaming = false;
+            e.state = st;
+            e.took_secs = e.started.map(|s| (now - s).num_seconds().max(0));
+        };
         match ev {
-            RunEvent::Label(_) => {}
+            RunEvent::Label(l) => e.label = Some(l),
+            RunEvent::Queued { label, task } => {
+                e.who = label.clone();
+                e.label = Some(label);
+                e.task = task.lines().next().map(str::to_string);
+                e.streaming = false;
+                e.state = LaneState::Queued;
+                e.started = None;
+            }
             RunEvent::Started { account } => {
                 e.who = account;
                 e.streaming = true;
+                e.state = LaneState::Running;
+                e.started.get_or_insert(now);
             }
             RunEvent::Delta(d) => e.text.push_str(&d),
             RunEvent::Note(n) => e.notes.push(n),
@@ -638,19 +749,25 @@ impl App {
                 cost,
             } => {
                 e.who = account;
-                e.streaming = false;
+                end(e, LaneState::Done);
                 e.meta = format!("{model} - {input} in / {output} out - ${cost:.4}");
                 self.session_cost += cost;
                 self.session_tokens += input + output;
             }
             RunEvent::Failed(err) => {
-                e.streaming = false;
+                end(e, LaneState::Failed);
                 e.failed = true;
                 e.text.push_str(&format!("\n[error] {err}"));
             }
             RunEvent::Cancelled => {
-                e.streaming = false;
+                end(e, LaneState::Failed);
                 e.notes.push("cancelled".into());
+            }
+            RunEvent::Info { .. } | RunEvent::Final { .. } => {}
+            RunEvent::Reset { reason } => {
+                e.text.clear();
+                e.notes
+                    .push(format!("restart: {}", reason.lines().next().unwrap_or("")));
             }
         }
         self.scroll_up = 0;
@@ -662,6 +779,8 @@ impl App {
         }
         let mut e = Entry::new(Role::Assistant, "...", "");
         e.streaming = true;
+        e.state = LaneState::Running;
+        e.started = Some(self.now);
         self.entries.push(e);
         let i = self.entries.len() - 1;
         self.lanes.insert(lane, i);
@@ -1212,7 +1331,8 @@ impl App {
                 edit.and_then(|a| a.base_url.clone())
                     .or_else(|| kind.default_base_url().map(Into::into))
                     .unwrap_or_default(),
-            ),
+            )
+            .hint("empty = provider default; set a gateway URL ending in /v1"),
             Field::text(
                 FieldId::Model,
                 "Model",
@@ -1291,12 +1411,16 @@ impl App {
             name,
             kind,
             api_key,
-            base_url: if kind.is_local() {
-                opt(FieldId::BaseUrl)
-            } else {
+            base_url: if kind.is_cli() {
                 None
+            } else {
+                opt(FieldId::BaseUrl)
             },
-            model: f.value(FieldId::Model),
+            model: if kind.is_cli() || edit.is_some() {
+                f.value(FieldId::Model)
+            } else {
+                String::new()
+            },
             cli_path: if kind.is_cli() {
                 opt(FieldId::CliPath)
             } else {
@@ -1321,7 +1445,27 @@ impl App {
         tokio::spawn(async move {
             match core.store.upsert_account(&core.vault, &a).await {
                 Ok(_) => {
-                    let _ = tx.send(Msg::Notice(format!("saved account '{}'", a.name)));
+                    let _ = tx.send(Msg::Notice(format!(
+                        "saved account '{}'; testing...",
+                        a.name
+                    )));
+                    // CLI accounts may still need `L` to sign in, so only test the others.
+                    if !a.kind.is_cli() {
+                        let started = std::time::Instant::now();
+                        let out = match providers::test_connection(&a).await {
+                            Ok(m) => format!(
+                                "saved '{}': OK, answered via {m} in {} ms",
+                                a.name,
+                                started.elapsed().as_millis()
+                            ),
+                            Err(e) => format!(
+                                "saved '{}' but test FAILED: {}",
+                                a.name,
+                                e.message.lines().next().unwrap_or("")
+                            ),
+                        };
+                        let _ = tx.send(Msg::Notice(out));
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(Msg::Notice(format!("{e:#}")));
@@ -1644,6 +1788,9 @@ impl App {
                 let n = pr.steps.len();
                 match k.code {
                     KeyCode::Esc => {
+                        if let Some(tx) = pr.reply.take() {
+                            let _ = tx.send(lead::Decision::Discard);
+                        }
                         self.notice = Some("plan discarded".into());
                         return;
                     }
@@ -1656,6 +1803,9 @@ impl App {
                             pr.steps.remove(pr.sel);
                         }
                         if pr.steps.is_empty() {
+                            if let Some(tx) = pr.reply.take() {
+                                let _ = tx.send(lead::Decision::Discard);
+                            }
                             self.notice = Some("plan discarded".into());
                             return;
                         }
@@ -1676,7 +1826,7 @@ impl App {
                     KeyCode::Char('r') => {
                         let f = Form::new(
                             FormKind::PlanFeedback,
-                            "Ask the planner to revise",
+                            "Ask the lead to revise the plan",
                             vec![Field::text(FieldId::Feedback, "Feedback", "")],
                         );
                         self.pending_plan = Some(pr);
@@ -1684,7 +1834,10 @@ impl App {
                         return;
                     }
                     KeyCode::Enter => {
-                        self.approve_plan(pr);
+                        if let Some(tx) = pr.reply.take() {
+                            let _ = tx.send(lead::Decision::Approve(pr.steps));
+                        }
+                        self.notice = Some("plan approved - running".into());
                         return;
                     }
                     _ => {}
@@ -1692,6 +1845,17 @@ impl App {
                 self.pending_plan = Some(pr);
                 self.modal = Some(Modal::Plan);
             }
+            Some(Modal::Questions(mut qs)) => match qs.on_key(k) {
+                Outcome::Pending => self.modal = Some(Modal::Questions(qs)),
+                Outcome::Cancel => {
+                    self.notice = Some("questions skipped".into());
+                    // The lead goes on without answers.
+                    if let Origin::Lead(tx) = qs.origin {
+                        let _ = tx.send(None);
+                    }
+                }
+                Outcome::Submit => self.submit_answers(*qs),
+            },
             Some(Modal::Confirm { text, action }) => match k.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.confirm(action),
                 KeyCode::Char('n') | KeyCode::Esc => {}
@@ -1799,12 +1963,11 @@ impl App {
                 if fb.is_empty() {
                     return Err("write what should change".into());
                 }
-                if let Some(pr) = self.pending_plan.take() {
-                    let prompt = format!(
-                        "{}\n\nFeedback on the previous plan (apply it): {fb}",
-                        pr.task
-                    );
-                    self.start_plan(false, prompt, pr.task);
+                if let Some(mut pr) = self.pending_plan.take()
+                    && let Some(tx) = pr.reply.take()
+                {
+                    let _ = tx.send(lead::Decision::Revise(fb));
+                    self.notice = Some("asking the lead to revise the plan".into());
                 }
             }
             FormKind::Passwd => {
@@ -1964,13 +2127,9 @@ impl App {
         if !routed {
             match self.mode {
                 Mode::Normal => {}
-                Mode::Plan => {
-                    self.start_plan(true, prompt.clone(), prompt);
-                    return;
-                }
-                Mode::Auto => {
-                    let shown = prompt.clone();
-                    self.orchestrate_task(prompt, shown);
+                Mode::Plan | Mode::Auto => {
+                    let review = self.mode == Mode::Plan;
+                    self.start_lead(prompt, review);
                     return;
                 }
             }
@@ -2001,17 +2160,31 @@ impl App {
             Some(a) => {
                 let mut r = modes::agent_req(a, prompt.clone());
                 r.turns = turns;
+                r.system = Some(match r.system.take() {
+                    Some(s) => format!("{s}\n\n{}", questions::CHAT_HINT),
+                    None => questions::CHAT_HINT.to_string(),
+                });
                 r
             }
             None => ChatRequest {
-                system: None,
+                system: Some(questions::CHAT_HINT.to_string()),
                 turns,
                 model: None,
+                restart_on_partial: false,
+                workspace: None,
+                json_schema: None,
             },
         };
         if let Some(m) = &self.model_override {
             req.model = Some(m.clone());
         }
+        if let Some(c) = &self.project_context {
+            req.system = Some(format!("{c}\n\n{}", req.system.take().unwrap_or_default()));
+        }
+        req.workspace = self.workspace.as_ref().map(|root| Workspace {
+            root: root.clone(),
+            access: Access::Read,
+        });
 
         // Old turns are folded into a running summary by the auxiliary account(s).
         let policy = self.routing.policy.clone();
@@ -2262,7 +2435,12 @@ impl App {
             }
             "fanout" => self.cmd_fanout(rest),
             "orchestrate" | "orch" => self.cmd_orchestrate(rest),
-            other => self.notice = Some(format!("unknown command /{other} - try /help")),
+            "omni" => self.cmd_omni(rest),
+            other => {
+                if !self.project_command(other, rest) {
+                    self.notice = Some(format!("unknown command /{other} - try /help"));
+                }
+            }
         }
     }
 
@@ -2351,6 +2529,9 @@ impl App {
             system: None,
             turns,
             model: None,
+            restart_on_partial: true,
+            workspace: None,
+            json_schema: None,
         };
         let prev = self.summary.clone();
         let focus = Some(focus.to_string()).filter(|f| !f.is_empty());
@@ -2411,30 +2592,56 @@ impl App {
         let rank = |slots: &[Slot], prefer, app: &Self| {
             balance::rank(slots, &app.accounts, &app.usage, app.now, &policy, prefer)
         };
-        let planner = if self.routing.planner.iter().any(|s| s.enabled) {
+        let target_chain = self
+            .target
+            .and_then(|t| self.chain_for_target(t))
+            .map(|(c, _)| c)
+            .unwrap_or_default();
+        let slot_chain = if self.routing.planner.iter().any(|s| s.enabled) {
             rank(&self.routing.planner, self.planner_last, self)
         } else {
-            self.target
-                .and_then(|t| self.chain_for_target(t))
-                .map(|(c, _)| c)
-                .unwrap_or_default()
+            vec![]
         };
-        if planner.is_empty() {
+        let planner = if slot_chain.is_empty() {
+            target_chain.clone()
+        } else {
+            slot_chain.clone()
+        };
+        // The model picked with /model leads, whatever the Routing slots say; without one
+        // the Planner slots lead, and without those the active account or agent.
+        let lead: Vec<Account> = match &self.model_override {
+            Some(m) => planner
+                .iter()
+                .cloned()
+                .map(|mut a| {
+                    a.model = m.clone();
+                    a
+                })
+                .collect(),
+            None => planner.clone(),
+        };
+        if lead.is_empty() {
             return Err(
-                "no planner available: set one on the Routing tab or choose a target with /use"
+                "no model to lead: choose one with /use (and /model), or set a Planner on the Routing tab"
                     .into(),
             );
         }
-        self.planner_last = planner.first().map(|a| a.id);
+        self.planner_last = lead.first().map(|a| a.id);
         Ok(modes::Team {
             agents: self.agents.clone(),
             accounts: self.accounts.clone(),
             synth: rank(&self.routing.synthesizer, None, self),
             planner,
+            lead,
             pool: self.routing.executors.clone(),
+            scouts: self.routing.auxiliary.clone(),
+            project: self.project.clone(),
             usage: self.usage.clone(),
             now: self.now,
             policy,
+            workspace: self.workspace.clone(),
+            read_only: self.read_only,
+            project_context: self.project_context.clone(),
         })
     }
 
@@ -2467,9 +2674,9 @@ impl App {
         );
     }
 
-    /// Asks the planner for steps; the review modal opens when they arrive.
-    /// `task` is what the planner is told, `original` what the user typed.
-    fn start_plan(&mut self, persist_user: bool, task: String, original: String) {
+    /// Runs the lead loop for `task` (scouts → lead → workers, see `orchestrator::lead`).
+    /// `review` makes the user approve the first plan.
+    fn start_lead(&mut self, task: String, review: bool) {
         let team = match self.team() {
             Ok(t) => t,
             Err(e) => {
@@ -2477,71 +2684,94 @@ impl App {
                 return;
             }
         };
-        if persist_user {
-            self.push_user(&original);
-        }
-        let context = self.summary.as_ref().map(|s| s.text.clone());
-        let base = self.alloc_lanes(64);
-        let tx = self.tx.clone();
-        self.spawn_task(persist_user, move |core, cancel, ui, _session| async move {
-            match modes::plan(&core, &team, &task, context.as_deref(), base, cancel, ui).await {
-                Ok(steps) => {
-                    let _ = tx.send(Msg::PlanReady {
-                        task: original,
-                        steps,
-                        base,
-                    });
+        let summary = self.summary.as_ref().map(|s| s.text.clone());
+        self.push_user(&task);
+        let base = self.alloc_lanes(256);
+        let (tx, project) = (self.tx.clone(), self.project.clone());
+        self.spawn_run(move |core, cancel, ui, session| async move {
+            let notify: lead::Notify = {
+                let tx = tx.clone();
+                Arc::new(move |m| {
+                    let _ = tx.send(Msg::Lead(m));
+                })
+            };
+            let r = lead::run(
+                &core,
+                &team,
+                &task,
+                summary.as_deref(),
+                base,
+                review,
+                cancel,
+                ui,
+                notify,
+            )
+            .await;
+            let outcome = r
+                .result
+                .as_ref()
+                .map(|o| o.text.clone())
+                .map_err(|e| e.clone());
+            let last = r.waves.len().saturating_sub(1);
+            for (i, w) in r.waves.iter().enumerate() {
+                let o = if i == last {
+                    outcome.clone()
+                } else {
+                    Ok("(the lead went on with another step)".to_string())
+                };
+                omni::save_plan(&project, &core.vault, &task, w, &o);
+            }
+            match r.result {
+                Ok(o) => {
+                    let m = Message {
+                        role: Role::Assistant,
+                        content: o.text,
+                        agent_name: Some("lead".into()),
+                        account_name: Some(o.account),
+                    };
+                    let _ = core.store.append_message(&core.vault, session, &m).await;
                 }
-                Err(e) => {
-                    let _ = tx.send(Msg::Notice(e));
+                Err(e) if e != "cancelled" => {
+                    let _ = tx.send(Msg::Notice(e.lines().next().unwrap_or("").to_string()));
                 }
+                Err(_) => {}
             }
         });
     }
 
-    fn approve_plan(&mut self, pr: PlanReview) {
-        let team = match self.team() {
-            Ok(t) => t,
-            Err(e) => {
-                self.notice = Some(e);
-                return;
+    /// Sends the picked answers back to whoever asked.
+    fn submit_answers(&mut self, qs: QuestionsState) {
+        let answers = qs.answers();
+        let text = questions::format_answers(&answers);
+        match qs.origin {
+            Origin::Chat => self.submit(format!("My answers:\n{text}")),
+            Origin::Lead(tx) => {
+                self.push_user(&format!("Answers:\n{text}"));
+                let _ = tx.send(Some(answers));
             }
+        }
+    }
+
+    /// After a plain chat reply: turns a trailing `omni-questions` block into the picker.
+    fn scan_chat_questions(&mut self) {
+        if self.modal.is_some() || self.pending_plan.is_some() {
+            return;
+        }
+        let Some(e) = self.entries.last_mut() else {
+            return;
         };
-        let PlanReview {
-            task, steps, base, ..
-        } = pr;
-        self.spawn_task(false, move |core, cancel, ui, session| async move {
-            let listing = steps
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let who = if s.agent.is_empty() {
-                        String::new()
-                    } else {
-                        format!("@{}: ", s.agent)
-                    };
-                    format!("{}. {who}{}", i + 1, s.task)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let m = Message {
-                role: Role::Assistant,
-                content: format!("Approved plan:\n{listing}"),
-                agent_name: Some("planner".into()),
-                account_name: None,
-            };
-            let _ = core.store.append_message(&core.vault, session, &m).await;
-            let r = modes::run_steps(&core, &team, &task, steps, base, cancel, ui).await;
-            if let Ok(o) = r.final_text {
-                let m = Message {
-                    role: Role::Assistant,
-                    content: o.text,
-                    agent_name: None,
-                    account_name: Some(o.account),
-                };
-                let _ = core.store.append_message(&core.vault, session, &m).await;
-            }
-        });
+        if e.role != Role::Assistant || e.failed || e.label.is_some() {
+            return;
+        }
+        let (clean, qs) = questions::extract_questions(&e.text);
+        if let Some(qs) = qs {
+            e.text = clean;
+            self.modal = Some(Modal::Questions(Box::new(QuestionsState::new(
+                qs,
+                Origin::Chat,
+            ))));
+            self.notice = Some("the model asks you to choose (Esc skips)".into());
+        }
     }
 
     pub fn routing_rows(&self) -> Vec<RoutingRow> {

@@ -82,10 +82,10 @@ Roles are stored encrypted in the database like everything else.
 
 | Section | Purpose |
 | --- | --- |
-| **Planner** | Splits the task into steps. Use a strong model. Without slots here, the active target plans. |
+| **Planner** | The lead of plan and auto mode. Use a strong model. Without slots here the active target leads; a model chosen with `/model` always wins. |
 | **Executors** | Pool for steps that do not name an agent. |
 | **Synthesizer** | Merges the results of 2+ steps. Empty means the planner does it. |
-| **Auxiliary** | Cheap housekeeping: summaries of old messages. A local model is ideal. |
+| **Auxiliary** | Cheap helpers: scouts that read the project and docs, and summaries of old messages. A local or low-cost model is ideal. |
 | **Policy** | Balancing and history limits (below). |
 
 Each slot is an account plus an optional **model** and, for Claude Code accounts, an **effort** (`--effort low|medium|high|xhigh|max`). The bar shows how much of the account is still free.
@@ -126,13 +126,65 @@ Failover works as before on the ordered chain.
 
 ### Plan mode
 
-In plan mode a message is not answered directly:
+Plan mode (and auto mode, without the review) runs a **lead loop**, in the style of Hermes Agent: cheap models gather context, the model you picked plans and orchestrates, cheap agents do the work.
 
-1. The **planner** returns 1–4 self-contained steps. A step may name an agent, or leave it empty for the executor pool.
-2. A **review** window opens: `Enter` approves, `e` edits a step's text, `d` removes a step, `r` asks the planner to revise with your feedback, `Esc` discards.
-3. Approved steps run in parallel on the balanced executors. With 2+ steps the **synthesizer** merges them; with one step its answer is final.
+1. **Scouts** (cheap, read-only, in parallel) read the project and its docs first: one project overview (cached in `.omni` until the git commit changes) and one look at what matters for your task. They run on the **Auxiliary** slots, or the executor pool when there are none. Without a project folder this step is skipped.
+2. The **lead** is the model you picked with `/use` + `/model` (or the Planner slots when you picked none). It has no tools and answers with one JSON object per turn (enforced with `--json-schema` for Claude and agy; others get one automatic repair retry). It can **ask** you (the question picker), **plan**, **delegate**, **scout** more, **remember** a fact in `.omni`, or **finish**.
+3. A **review** window opens for the first plan: `Enter` approves, `e` edits a step, `d` removes one, `r` asks the lead to revise, `Esc` discards. Each step says whether it may write or only read.
+4. Approved steps run on the balanced executors: steps that write run one after another, read-only ones in parallel. When they end the lead gets their reports **and what really changed on disk** (`git status` + `git diff --stat`, shown as a `changes` entry), then decides: delegate again, fix something, or finish. It has at most 8 turns.
+5. The lead's `finish` message is the answer.
 
-`@name message` still goes straight to that agent or account. `/orchestrate <task>` does the same pipeline without the review.
+Typical setup: put a strong model in **Planner** (or `/model` it), cheap models in **Executors** and **Auxiliary**.
+
+`@name message` still goes straight to that agent or account. `/orchestrate <task>` keeps the older fixed pipeline (plan → parallel steps → synthesis) without review.
+
+**If it seems stuck.** A lane with no output for 90 s shows `no output for 90s (still running)`; after 10 minutes the process is stopped and the next account (or an error) takes over. Change both with `OMNICRAB_IDLE_WARN_SECS` and `OMNICRAB_IDLE_KILL_SECS`. `RUST_LOG=omnicrab=debug omnicrab` logs every run (account, model, duration, result, CLI stderr) to `~/.local/state/omnicrab/omnicrab.log.*`.
+
+**Watching a run.** Every lane (planner, each step, synthesis) has its own entry with a state (`queued`, `running 12s`, `done 31s`, `failed`), the account that is answering, and its tool activity on separate `↳` lines (files read or edited, shell commands, web searches; the last six are shown). A lane that has not produced text yet shows `thinking…`. The status bar counts running and queued lanes and the elapsed time. If a provider fails after it already streamed part of a planner, step or synthesis answer, the partial text is dropped (`restart:` note) and the next account in the chain tries again. If every synthesizer fails, you get the raw step results instead of nothing.
+
+**Questions.** When the planner (or, in chat, the model) needs a decision it cannot make itself, a **Questions** window opens, like Claude Code's:
+
+| Key | Action |
+| --- | --- |
+| `↑`/`↓`, `j`/`k` | Move the highlight (`1`–`9` mark that option) |
+| `Enter` | Confirm the question (the highlighted row counts if nothing is marked) and go to the next one; submits after the last |
+| `Space` | Mark the highlighted option (toggle in multiple choice); never closes the window |
+| `←`/`→`, `Tab` | Switch question |
+| last row **Other** | Type your own answer, `Enter` to confirm |
+| `Esc` | Skip (the planner then plans without answers) |
+
+Your answers are shown in the chat and sent back: the planner plans again with them; in chat they are your next message.
+
+### Project folder and access
+
+omnicrab starts CLI agents (Claude Code, Codex, Gemini, `agy`) **inside the folder it was opened in**, so they see your code. Executors may read and edit files and run commands there; the planner and plain chat can only read. The status bar shows `rw <folder>` or `ro <folder>`.
+
+- `omnicrab --workspace <dir>` uses another folder; `--read-only` (or `"read_only": true` in the project settings) stops all edits.
+- `/` and your home directory are refused unless you pass them with `--workspace`.
+- Steps that may edit files run **one after another** (each gets a short summary of the earlier results) so they do not overwrite each other. Read-only runs stay parallel.
+- API-key and Ollama accounts have no file access; they only get the text of their task.
+
+### The `.omni` folder
+
+On unlock omnicrab creates `<project>/.omni/`, its equivalent of `.claude/` / `.gemini/`. Everything in it is **encrypted with the vault key** (only `project.toml`, a random project id, is plain), so it is safe in a shared checkout but unreadable without your master password. `.omni/.gitignore` ignores it.
+
+| Item | Purpose |
+| --- | --- |
+| `instructions` | Project instructions (like `CLAUDE.md`), added to every prompt |
+| `memory` | Notes that persist between runs, added to every prompt |
+| `settings` | `{"read_only": true}` |
+| `agents` | JSON list of agents available only in this project (accounts by name) |
+| `commands` | JSON list of custom commands: `{"name","description","prompt"}`; `$ARGUMENTS` is replaced by what follows `/name` |
+| `plans/`, `sessions/` | Every approved plan with its result, and the transcript of each session (written automatically) |
+
+| Command | Action |
+| --- | --- |
+| `/omni` | Status: what exists, counts |
+| `/omni init` | Import `CLAUDE.md`, `GEMINI.md`, `AGENTS.md` into the instructions |
+| `/omni edit [doc]` | Decrypt one document to a private temp file, open `$VISUAL`/`$EDITOR`, re-encrypt on save and delete the copy (JSON documents are validated; a rejected text is kept in `/tmp/omnicrab-<doc>.rejected`) |
+| `/omni remember <note>` | Append a line to the memory |
+
+The CLI agents cannot read the encrypted files; omnicrab decrypts instructions and memory and passes them in the prompt. Claude Code is also told not to edit `.omni/`.
 
 ### Saving tokens
 
@@ -189,6 +241,8 @@ Cost is computed from the [price table](providers.md#pricing); CLI accounts use 
 | `/plan` | Toggle plan mode (`Shift+Tab` cycles chat / plan / auto) |
 | `/fanout a,b,c <prompt>` | Send one prompt to several accounts in parallel (names comma separated, no spaces) |
 | `/orchestrate <task>` | Plan → parallel agents → synthesis (see below) |
+| `/omni [init\|edit <doc>\|remember <note>]` | Encrypted project state in `.omni/` (see above) |
+| `/<name> [args]` | A custom command from `.omni` |
 | `/compact [focus]` | Summarize older messages now (see below) |
 | `/rename <title>` | Rename the current session |
 | `/passwd` | Change the master password |
@@ -228,7 +282,9 @@ Logs are written to `~/.local/state/omnicrab/omnicrab.log.*` (never to the termi
 ## CLI
 
 ```
-omnicrab            # start the TUI
-omnicrab doctor     # check database, Ollama and installed CLIs
-omnicrab init-db    # run migrations only
+omnicrab                       # start the TUI in the current folder
+omnicrab --workspace ~/proj    # work in another folder
+omnicrab --read-only           # agents may not change the project
+omnicrab doctor                # check database, Ollama and installed CLIs
+omnicrab init-db               # run migrations only
 ```

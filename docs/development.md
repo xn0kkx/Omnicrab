@@ -16,6 +16,8 @@ Verified end-to-end on Linux with PostgreSQL 17 and the real Claude Code CLI, An
 
 Plan mode, routing and balancing (unit-tested for ranking, plan parsing, history cut points and model-list parsing) were also exercised against the real Claude Code and `agy` CLIs on a scratch database: role slots persist across restarts and are encrypted in `settings`, the model picker lists `agy models` and the Claude aliases, a plan with two steps was reviewed, edited by removing a step and executed on the pool, and a single-step plan skipped synthesis.
 
+The lead loop (scouts, JSON turns, question picker, plan review, workers editing files, `git` change report, `.omni`) was driven end to end in tmux against a throwaway PostgreSQL cluster and a git repo: first with stub `claude` binaries (valid turns, prose replies that need the repair retry, a hung CLI stopped by the watchdog), then with the real Claude CLI on `haiku` (two worker steps wrote `hello.txt` and `notes.md`; about $0.01). Not yet run end to end: `agy` as lead or worker with `--json-schema`, `/omni edit` in a real editor, and read-only (`--read-only`) runs.
+
 Not yet verified: the Codex and Gemini CLI adapters (they follow the documented JSONL formats but were never run against the real CLIs), API-key providers against their real endpoints, and non-Linux platforms.
 
 ## Requirements

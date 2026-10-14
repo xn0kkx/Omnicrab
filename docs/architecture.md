@@ -39,7 +39,9 @@ omnicrab is a single Rust binary. The UI never calls providers directly: it talk
 | `src/orchestrator/compact.rs` | History-size estimate, cut point, summary prompt (pure) |
 | `src/providers/catalog.rs` | Lists the models of an account for the pickers |
 | `src/usage.rs` | Price table, time windows, aggregation, latest plan-limit snapshot per account |
-| `src/tui/` | `app` (state/events, plan review, routing keys), `ui` (rendering), `form` (modal forms), `crab` (chat mascot animation) |
+| `src/orchestrator/questions.rs` | Questions a model can ask (planner JSON, chat `omni-questions` block): parsing and limits |
+| `src/project/` | Workspace root choice and `.omni/` (sealed documents, plans, sessions, project agents/commands) |
+| `src/tui/` | `app` (state/events, plan review, routing keys; `app/omni.rs` for `.omni`), `ui` (rendering), `form` (modal forms), `questions` (question picker state), `crab` (chat mascot animation) |
 
 ## Event flow for one chat message
 
@@ -49,9 +51,13 @@ omnicrab is a single Rust binary. The UI never calls providers directly: it talk
 4. On a failover-class error with no text yet shown, it moves to the next account; otherwise it finishes or reports the failure.
 5. The finished answer is stored as an encrypted message; `Msg::RunDone` triggers a reload of accounts, agents, sessions and usage.
 
-### Plan mode
+### Plan and auto mode: the lead loop
 
-With plan mode on, `submit` builds a `modes::Team` (planner/synthesizer chains ranked by `balance::rank`, executor pool slots, a usage snapshot) and runs `modes::plan` in a task. The steps come back as `Msg::PlanReady`, which stores `App::pending_plan` and opens the review modal. Approval runs `modes::run_steps` (`execute` + `synthesize`) with the lanes reserved at planning time. Editing a step or asking for a revision goes through small forms (`FormKind::PlanStep`, `PlanFeedback`); closing them returns to the review.
+`App::start_lead` builds a `modes::Team` (`lead` chain: the `/model` override on the active target, else the Planner slots; `scouts` = Auxiliary slots; `pool` = executors; project context; workspace) and runs `lead::run` in one task. The task talks to the UI through `Msg::Lead` and oneshot channels: `LeadMsg::Ask` opens `Modal::Questions`, `LeadMsg::Review` opens the plan review, and the loop waits for the answer (or for cancellation).
+
+`lead::run`: `scout_phase` (overview digest cached per `HEAD` in `.omni/digest.enc`, plus a task-specific scout) → up to 8 turns of `ask_lead` (`ChatRequest.json_schema`, `parse_turn`, one repair retry) → for `plan`/`delegate`, `modes::execute` runs the steps (sequential when any step writes, otherwise parallel) and `project::git_changes` reports what changed; the reports go into the log the next turn sees (older entries are trimmed first). `finish` emits `RunEvent::Final`. `/orchestrate` still uses `modes::orchestrate` (plan → execute → synthesize).
+
+Each lane is announced with `RunEvent::Queued`, then `Started`, tool `Note`s, and `Finished`/`Failed`. `RunEvent::Reset` clears a lane's text when a provider restarts or fails after partial output (requests with `restart_on_partial`). `Core::run` has a watchdog (`Limits`: warn, then stop and fail over when a run stays silent) and logs each run with `tracing`. Structured (`json_schema`) answers are not streamed to the chat. Requests carry an optional `Workspace { root, access }`; `cli_backend::build_command` maps it to each CLI's flags and working directory. The Claude CLI returns schema-constrained answers as a `StructuredOutput` tool call and agy in `structured_output`; the parser turns both into the answer text.
 
 ### History compaction
 

@@ -2,6 +2,7 @@ mod config;
 mod crypto;
 mod model;
 mod orchestrator;
+mod project;
 mod providers;
 mod store;
 mod tui;
@@ -17,6 +18,12 @@ use clap::{Parser, Subcommand};
     about = "Orchestrate AI agents across many accounts and local models"
 )]
 struct Cli {
+    /// Project folder agents work in (default: the current directory).
+    #[arg(long, global = true, value_name = "DIR")]
+    workspace: Option<std::path::PathBuf>,
+    /// Agents may read the project but not change it.
+    #[arg(long, global = true)]
+    read_only: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -57,7 +64,10 @@ async fn main() -> Result<()> {
         }
         None => {
             let store = store::Store::connect(&cfg.database_url()?).await?;
-            tui::run(store, &cfg).await
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let workspace = project::resolve_root(cli.workspace, &cwd, home.as_deref());
+            tui::run(store, &cfg, workspace, cli.read_only).await
         }
     }
 }

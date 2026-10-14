@@ -51,7 +51,13 @@ Row ids, foreign keys, `created_at`, the message `seq` and the HMAC blind index.
 
 ## Subscription credentials
 
-omnicrab never touches OAuth tokens of vendor subscriptions. CLI-backed accounts run the vendor binary, which uses its own credential store. CLI subprocesses run in a temp directory with tools disabled/read-only.
+omnicrab never touches OAuth tokens of vendor subscriptions. CLI-backed accounts run the vendor binary, which uses its own credential store.
+
+CLI subprocesses run in the **project folder** omnicrab was opened in (not in a temp directory). Executors get edit and shell access there, the planner and chat are read-only, and `--read-only` removes write access altogether. Treat an executor like any coding agent working in that checkout: it can change files and run commands, so use version control. `/` and the home directory are refused as workspaces unless passed explicitly with `--workspace`.
+
+## The `.omni` folder
+
+`<project>/.omni/` holds instructions, memory, settings, project agents/commands, approved plans and session transcripts. Each file is sealed like a database record (XChaCha20-Poly1305, vault key) with AAD `omni:<project id>:<kind>:<file id>`: a file copied to another kind, file id or project fails to decrypt, and so does one made with another vault. Files are written atomically with mode 0600 in a 0700 directory. Plaintext: `project.toml` (random project id and format version), file names, sizes and timestamps. `/omni edit` decrypts one document into a 0700 temp directory for the editor and deletes it afterwards; a rejected edit is kept in `/tmp/omnicrab-<doc>.rejected` so you do not lose it. The CLI agents cannot read the ciphertext, and Claude Code is launched with `Edit`/`Write` on `.omni/**` denied; other CLIs are not restricted, but any tampering is detected on the next read.
 
 ## Operational advice
 
