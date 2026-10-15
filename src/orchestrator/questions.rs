@@ -135,7 +135,6 @@ mod tests {
     fn rejects_unusable_questions() {
         assert!(parse_questions("not json").is_none());
         assert!(parse_questions(r#"{"questions":[]}"#).is_none());
-        // One option is not a choice.
         let one = r#"{"questions":[{"question":"Pick","options":[{"label":"a"}]}]}"#;
         assert!(parse_questions(one).is_none());
     }
@@ -154,7 +153,6 @@ mod tests {
     fn planner_reply_with_prose() {
         let text = format!("Before I plan:\n```json\n{Q}\n```");
         assert_eq!(find_questions(&text).unwrap()[0].question, "Which gateway?");
-        // A plan is not a questions object.
         assert!(find_questions(r#"[{"agent":"","task":"do"}]"#).is_none());
     }
 
@@ -164,7 +162,6 @@ mod tests {
         let (clean, qs) = extract_questions(&text);
         assert_eq!(clean, "I need one thing.");
         assert_eq!(qs.unwrap().len(), 1);
-        // Invalid block: text is untouched.
         let bad = format!("hi\n{FENCE}\n{{oops}}\n```");
         assert_eq!(extract_questions(&bad), (bad.clone(), None));
         assert_eq!(extract_questions("plain"), ("plain".into(), None));

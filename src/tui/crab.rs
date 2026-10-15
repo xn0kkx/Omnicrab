@@ -70,7 +70,6 @@ mod tests {
             seen.insert(o);
         }
         assert!(seen.len() > 10);
-        // Claws alternate while running.
         assert_ne!(frame(0, true, w).0, frame(2, true, w).0);
     }
 

@@ -31,7 +31,6 @@ pub fn cut_point(turns: &[ChatTurn], budget_tokens: usize, keep_last: usize) -> 
     if estimate_turns(turns) <= budget_tokens {
         return None;
     }
-    // Keep the first turn and the last `keep_last` verbatim.
     let tail_start = turns.len().saturating_sub(keep_last.max(1));
     (tail_start > 1).then(|| tail_start - 1)
 }

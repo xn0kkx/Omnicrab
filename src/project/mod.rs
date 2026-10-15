@@ -410,7 +410,6 @@ impl ProjectDir {
         Ok((!parts.is_empty()).then(|| parts.join("\n\n")))
     }
 
-    /// Adds a line to the memory document.
     pub fn remember(&self, vault: &Vault, note: &str) -> Result<(), String> {
         let mut text = self.read_doc(vault, Doc::Memory)?.unwrap_or_default();
         if !text.is_empty() && !text.ends_with('\n') {
@@ -443,7 +442,6 @@ impl ProjectDir {
         self.put_bytes(vault, Some("plans"), "plans", Uuid::new_v4(), &json)
     }
 
-    /// Rewrites the transcript of a session.
     pub fn save_session(&self, vault: &Vault, id: Uuid, msgs: &[Message]) -> Result<(), String> {
         let json = serde_json::to_vec(msgs).map_err(|e| e.to_string())?;
         self.put_bytes(vault, Some("sessions"), "sessions", id, &json)
@@ -456,7 +454,6 @@ impl ProjectDir {
             .transpose()
     }
 
-    /// Number of files in `plans/` or `sessions/`.
     pub fn count(&self, sub: &str) -> usize {
         fs::read_dir(self.dir.join(sub))
             .map(|d| d.filter_map(Result::ok).count())
@@ -579,7 +576,6 @@ mod tests {
             fs::read_to_string(root.join(".omni/.gitignore")).unwrap(),
             "*\n"
         );
-        // Reopening finds the same project.
         assert_eq!(ProjectDir::open(&root).unwrap().id, p.id);
         let _ = fs::remove_dir_all(root);
     }

@@ -29,8 +29,6 @@ impl Store {
         Ok(Self { pool })
     }
 
-    // ---------- vault ----------
-
     pub async fn vault_header(&self) -> Result<Option<VaultHeader>> {
         let row =
             sqlx::query("SELECT kdf_salt, kdf_params, wrapped_dek FROM vault_meta WHERE id = 1")
@@ -50,7 +48,19 @@ impl Store {
             bail!("vault already initialized");
         }
         let (vault, header) = Vault::create(password)?;
-        self.save_header(&header).await?;
+        // DO NOTHING: a concurrent init must never overwrite an existing wrapped DEK.
+        let done = sqlx::query(
+            "INSERT INTO vault_meta (id, kdf_salt, kdf_params, wrapped_dek) VALUES (1, $1, $2, $3)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&header.kdf_salt)
+        .bind(serde_json::to_value(header.kdf_params)?)
+        .bind(&header.wrapped_dek)
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() == 0 {
+            bail!("vault already initialized");
+        }
         Ok(Arc::new(vault))
     }
 
@@ -66,8 +76,6 @@ impl Store {
         .await?;
         Ok(())
     }
-
-    // ---------- accounts ----------
 
     pub async fn upsert_account(&self, v: &Vault, a: &Account) -> Result<Uuid> {
         let id = if a.id.is_nil() { Uuid::new_v4() } else { a.id };
@@ -118,8 +126,6 @@ impl Store {
         Ok(())
     }
 
-    // ---------- agents ----------
-
     pub async fn upsert_agent(&self, v: &Vault, a: &Agent) -> Result<Uuid> {
         let id = if a.id.is_nil() { Uuid::new_v4() } else { a.id };
         let blob = v.seal_json("agents", "blob", &id, a)?;
@@ -157,8 +163,6 @@ impl Store {
             .await?;
         Ok(())
     }
-
-    // ---------- sessions & messages ----------
 
     pub async fn create_session(&self, v: &Vault, id: Uuid, title: &str) -> Result<Uuid> {
         let blob = v.seal_json(
@@ -260,8 +264,6 @@ impl Store {
             .collect()
     }
 
-    // ---------- settings ----------
-
     /// Stable row id per setting key, so the AAD stays unique without a second column.
     fn setting_id(key: &str) -> Uuid {
         use sha2::{Digest, Sha256};
@@ -311,8 +313,6 @@ impl Store {
         .await?;
         Ok(())
     }
-
-    // ---------- usage ----------
 
     pub async fn record_usage(&self, v: &Vault, account: Uuid, e: &UsageEvent) -> Result<()> {
         let id = Uuid::new_v4();

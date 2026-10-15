@@ -16,7 +16,7 @@ use super::questions::QuestionsState;
 use crate::model::*;
 use crate::usage::Window;
 
-const ACCENT: Color = Color::Rgb(222, 115, 61); // rust orange
+const ACCENT: Color = Color::Rgb(222, 115, 61);
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -255,8 +255,6 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-// ---------------------------------------------------------------- chat
-
 /// Most notes (tool activity, failovers) shown per lane.
 const MAX_NOTES: usize = 6;
 
@@ -293,7 +291,7 @@ fn draw_crab(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // The message box grows with its content (wrapped rows, not just lines) up to
-    // a cap and scrolls to keep the cursor visible, like Claude Code's prompt.
+    // a cap and scrolls to keep the cursor visible.
     let cursor = if app.tick % 6 < 3 { "▏" } else { " " };
     let box_w = (area.width.saturating_sub(2) as usize).max(1);
     let (cur_line, cur_col) = app.input.line_col();
@@ -497,8 +495,6 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-// ---------------------------------------------------------------- lists
-
 fn money(v: f64) -> String {
     if v >= 100.0 {
         format!("${v:.0}")
@@ -691,8 +687,6 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-// ---------------------------------------------------------------- usage
-
 fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
     let limits_h = app.accounts.len().clamp(1, 6) as u16 + 2;
     let [top, limits, bottom] = Layout::vertical([
@@ -764,7 +758,6 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
 
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(bottom);
-    // Left: tokens/day sparkline + budget gauge for the selected account.
     let sel = app.accounts.get(app.sel[3]);
     let lb = Block::bordered()
         .title(format!(
@@ -813,7 +806,6 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
             ),
         }
     }
-    // Right: cost per account, bars.
     let names: Vec<String> = app
         .accounts
         .iter()
@@ -942,8 +934,6 @@ fn draw_limits(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 }
-
-// ---------------------------------------------------------------- modals
 
 fn draw_switcher(f: &mut Frame, sel: usize, current: Tab) {
     let a = centered(f.area(), 34, Tab::ALL.len() as u16 + 4);
@@ -1094,8 +1084,6 @@ fn draw_help(f: &mut Frame) {
         a.inner(Margin::new(0, 0)),
     );
 }
-
-// ---------------------------------------------------------------- routing
 
 fn room_bar(room: Option<f64>) -> Span<'static> {
     match room {
@@ -1321,7 +1309,6 @@ fn draw_questions(f: &mut Frame, qs: &QuestionsState, tick: u64) {
     let a = centered(f.area(), 90, (opts_h as u16 + 8).min(f.area().height));
     f.render_widget(Clear, a);
 
-    // Tabs: one chip per question, ✓ once answered.
     let mut tabs: Vec<Span> = vec![];
     for (i, qu) in qs.questions.iter().enumerate() {
         let mark = if qs.answered(i) { "✓" } else { " " };

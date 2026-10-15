@@ -341,7 +341,6 @@ pub async fn execute(
     )
     .into_iter();
 
-    // Show every lane (and the synthesis) right away, with the task each one will do.
     for (i, s) in steps.iter().enumerate() {
         let label = match resolve_agent(&team.agents, &s.agent) {
             Some(a) => format!("@{}", a.name),
@@ -356,7 +355,6 @@ pub async fn execute(
         ));
     }
 
-    // (lane, label, chain, request) for every step.
     let mut jobs = Vec::new();
     for (i, s) in steps.iter().enumerate() {
         let (chain, mut req, label) = match resolve_agent(&team.agents, &s.agent) {

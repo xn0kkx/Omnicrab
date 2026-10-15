@@ -275,7 +275,6 @@ fn build_prompt(
     if let Some(d) = digest {
         p.push_str(&format!("\n# What the scouts found\n{d}\n"));
     }
-    // Keep the newest entries when the log gets long.
     let mut kept: Vec<&String> = vec![];
     let mut size = 0;
     for e in log.iter().rev() {
@@ -828,7 +827,6 @@ mod tests {
         assert!(parse_turn(r#"{"actions":[{"type":"dance"}]}"#).is_err());
         assert!(parse_turn(r#"{"actions":[{"type":"ask","questions":[{"question":"x","options":[{"label":"a"}]}]}]}"#).is_err());
         assert!(parse_turn(r#"{"actions":[]}"#).is_err());
-        // Only a message: it is the answer.
         let t = parse_turn(r#"{"say":"hello","actions":[]}"#).unwrap();
         assert!(t.actions.is_empty() && t.say == "hello");
     }

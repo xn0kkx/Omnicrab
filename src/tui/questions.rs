@@ -238,7 +238,7 @@ mod tests {
         for _ in 0..9 {
             s.on_key(key(KeyCode::Down));
         }
-        assert_eq!(s.cursor[0], 3); // "Other" is the last row
+        assert_eq!(s.cursor[0], 3);
         s.on_key(key(KeyCode::Up));
         assert_eq!(s.cursor[0], 2);
     }

@@ -139,7 +139,6 @@ pub enum PickPurpose {
 
 pub struct Picker {
     pub title: String,
-    /// `(label, value)`
     pub items: Vec<(String, String)>,
     pub filter: String,
     pub sel: usize,
@@ -536,8 +535,6 @@ impl App {
         result
     }
 
-    // ------------------------------------------------------------------ messages
-
     fn on_msg(&mut self, m: Msg) {
         match m {
             Msg::RunDone => {
@@ -828,8 +825,6 @@ impl App {
         });
     }
 
-    // ------------------------------------------------------------------ keys
-
     fn on_key(&mut self, mut k: KeyEvent) {
         // Many terminals send ^H (0x08) or ^? for Backspace; crossterm reports those as Ctrl+char.
         if k.modifiers == KeyModifiers::CONTROL
@@ -952,7 +947,6 @@ impl App {
 
     fn on_key_main(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        // Global tab switching.
         match k.code {
             KeyCode::F(n @ 1..=6) => {
                 self.tab = Tab::ALL[(n - 1) as usize];
@@ -985,7 +979,6 @@ impl App {
             self.on_key_chat(k);
             return;
         }
-        // List tabs
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
@@ -1120,7 +1113,6 @@ impl App {
                     self.submit(text.trim().to_string());
                 }
             }
-            // Editing, as in a readline prompt.
             KeyCode::Left if alt => self.input.word_left(),
             KeyCode::Right if alt => self.input.word_right(),
             KeyCode::Char('b') if alt => self.input.word_left(),
@@ -1190,8 +1182,6 @@ impl App {
         }
         vec![]
     }
-
-    // ------------------------------------------------------------------ accounts tab
 
     fn on_key_accounts(&mut self, k: KeyEvent) {
         let sel = self.accounts.get(self.sel[1]).cloned();
@@ -1505,8 +1495,6 @@ impl App {
         });
     }
 
-    // ------------------------------------------------------------------ agents tab
-
     fn on_key_agents(&mut self, k: KeyEvent) {
         let sel = self.agents.get(self.sel[2]).cloned();
         match k.code {
@@ -1637,8 +1625,6 @@ impl App {
         })
     }
 
-    // ------------------------------------------------------------------ sessions tab
-
     fn on_key_sessions(&mut self, k: KeyEvent) {
         let sel = self.sessions.get(self.sel[4]).cloned();
         match k.code {
@@ -1717,8 +1703,6 @@ impl App {
             let _ = tx.send(Msg::HeaderReady(h));
         });
     }
-
-    // ------------------------------------------------------------------ modal keys
 
     fn on_key_modal(&mut self, k: KeyEvent) {
         match self.modal.take() {
@@ -2044,8 +2028,6 @@ impl App {
         self.active_runs += 1;
     }
 
-    // ------------------------------------------------------------------ chat submit & commands
-
     /// Longest agent/account name at the start of `s` (case-insensitive) that ends at
     /// whitespace, a comma or the end of the text. Agents win ties.
     fn take_name<'a>(&self, s: &'a str, accounts_only: bool) -> Option<(Target, &'a str)> {
@@ -2108,7 +2090,6 @@ impl App {
             self.command(cmd.trim());
             return;
         }
-        // @name routing
         let routed = text.starts_with('@');
         let (target, prompt) = match text.strip_prefix('@') {
             Some(rest) => match self.take_name(rest, false) {
@@ -2150,7 +2131,6 @@ impl App {
             return;
         }
 
-        // History for the model (before adding this turn).
         let mut turns = self.history_turns();
         turns.push(ChatTurn {
             role: Role::User,
@@ -2583,8 +2563,6 @@ impl App {
         });
     }
 
-    // ------------------------------------------------------------------ routing, plan mode
-
     /// Planner/executor/synthesizer accounts for a multi-step run. The planner comes from the
     /// Routing tab, or from the active target when none is configured.
     fn team(&mut self) -> Result<modes::Team, String> {
@@ -2645,7 +2623,7 @@ impl App {
         })
     }
 
-    /// `Shift+Tab` in Chat, like Claude Code's mode cycling: normal → plan → auto.
+    /// `Shift+Tab` in Chat cycles: normal → plan → auto.
     fn cycle_mode(&mut self) {
         self.set_mode(match self.mode {
             Mode::Normal => Mode::Plan,
@@ -3047,7 +3025,7 @@ mod tests {
         assert_eq!(Tab::at_column(0), None);
         assert_eq!(Tab::at_column(1), Some(Tab::Chat));
         assert_eq!(Tab::at_column(8), Some(Tab::Chat));
-        assert_eq!(Tab::at_column(9), None); // divider
+        assert_eq!(Tab::at_column(9), None);
         assert_eq!(Tab::at_column(10), Some(Tab::Accounts));
         assert_eq!(Tab::at_column(200), None);
         for t in Tab::ALL {

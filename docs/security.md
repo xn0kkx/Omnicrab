@@ -59,6 +59,12 @@ CLI subprocesses run in the **project folder** omnicrab was opened in (not in a 
 
 `<project>/.omni/` holds instructions, memory, settings, project agents/commands, approved plans and session transcripts. Each file is sealed like a database record (XChaCha20-Poly1305, vault key) with AAD `omni:<project id>:<kind>:<file id>`: a file copied to another kind, file id or project fails to decrypt, and so does one made with another vault. Files are written atomically with mode 0600 in a 0700 directory. Plaintext: `project.toml` (random project id and format version), file names, sizes and timestamps. `/omni edit` decrypts one document into a 0700 temp directory for the editor and deletes it afterwards; a rejected edit is kept in `/tmp/omnicrab-<doc>.rejected` so you do not lose it. The CLI agents cannot read the ciphertext, and Claude Code is launched with `Edit`/`Write` on `.omni/**` denied; other CLIs are not restricted, but any tampering is detected on the next read.
 
+## Upgrades and rebuilds
+
+The binary contains no key material. The DEK is random per vault, created on first run and stored only wrapped under the password-derived KEK in `vault_meta`; salt and KDF parameters live there too. Rebuilding or updating omnicrab therefore never changes the key: the new binary unwraps the same DEK from the same database.
+
+The domain-separation labels (`vault_meta:wrapped_dek`, `omnicrab/blind-index-key`), the AAD formats (`<table>:<column>:<row uuid>`, `omni:<project id>:<kind>:<file id>`) and the blind-index normalization are part of the stored format. They are not secrets, but changing any of them makes existing data undecryptable. A fixed-vector test in `src/crypto/vault.rs` fails if that happens; a deliberate change needs a migration and a `FORMAT_VERSION` bump.
+
 ## Operational advice
 
 - **Back up the database and remember the password.** There is no recovery path.

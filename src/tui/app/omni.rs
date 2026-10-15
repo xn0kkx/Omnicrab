@@ -107,7 +107,6 @@ impl App {
     pub(super) fn merge_project_agents(&mut self) {
         let (extra, problems) = resolve_agents(&self.project_agent_defs, &self.accounts);
         let taken: HashSet<String> = self.agents.iter().map(|a| a.name.to_lowercase()).collect();
-        // Drop the previous project agents first so reloading never duplicates them.
         let old = std::mem::take(&mut self.project_agent_ids);
         self.agents.retain(|a| !old.contains(&a.id));
         for a in extra {

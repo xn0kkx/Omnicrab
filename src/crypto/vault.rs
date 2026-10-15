@@ -59,7 +59,6 @@ fn derive_kek(
 }
 
 impl Vault {
-    /// Create a brand-new vault with a random DEK.
     pub fn create(password: &str) -> Result<(Self, VaultHeader), CryptoError> {
         Self::create_with(password, KdfParams::default())
     }
@@ -221,5 +220,39 @@ mod tests {
             v.blind_index("acct", "work")
         );
         assert_ne!(v.blind_index("acct", "a"), v.blind_index("acct", "b"));
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Vectors produced once by an earlier build. If this fails, the stored format changed
+    /// (a domain label, the AAD layout or the blind-index normalization) and existing vaults
+    /// would no longer open: add a migration and bump `FORMAT_VERSION` instead of editing these.
+    #[test]
+    fn stored_format_is_stable() {
+        let h = VaultHeader {
+            kdf_salt: unhex("4c9eb9d8d66af4b2e662dc9c16a1c5f1"),
+            kdf_params: P,
+            wrapped_dek: unhex(
+                "01b2e20ba5e3d87e3c01a48b5e3425036692f2320d9c2a81e0d2c0e2d8eddb8b769acbce02bc61c7b9342b150ccc23f86c87281614a31bc5ceeaa498239e418b69e555452055547179",
+            ),
+        };
+        let v = Vault::unlock("pw", &h).unwrap();
+        let blob = unhex(
+            "01861096403a57b4cc88799fb6406258eac8f087224df5364007fa8e1c43ac7853467618d247824daf0d545014c7a4979cd8fb2a40",
+        );
+        let id = uuid::Uuid::from_u128(1);
+        assert_eq!(
+            &**v.open("accounts", "blob", &id, &blob).unwrap(),
+            b"fixed-secret"
+        );
+        assert_eq!(
+            v.blind_index("account_name", " Work "),
+            unhex("4963c6c278f5abe771004150e5e6e2a7c06861652626004389365875851f50fe")
+        );
     }
 }

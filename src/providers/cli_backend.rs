@@ -764,7 +764,6 @@ mod tests {
         assert!(l.five_hour.is_none());
         assert_eq!(l.seven_day.unwrap().utilization, 0.9);
 
-        // Nothing usable.
         let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
         assert!(parse_line(ProviderKind::ClaudeCli, line).limits.is_none());
     }
