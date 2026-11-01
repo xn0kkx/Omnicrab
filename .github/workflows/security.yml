@@ -134,6 +134,9 @@ jobs:
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Requires the Dependency graph repo setting (Settings > Security > Advanced
+    # Security). Remove continue-on-error once it is enabled so the gate blocks.
+    continue-on-error: true
     permissions:
       contents: read
     steps:
